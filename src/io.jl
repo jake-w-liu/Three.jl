@@ -1,0 +1,279 @@
+# --------------------------------------------------------------------------
+# Image I/O: export rendered images to PPM (no external deps) and PNG.
+# --------------------------------------------------------------------------
+
+"""
+Save image as PPM (Portable Pixmap) — no dependencies needed.
+`image` is Array{T, 3} of size (H, W, 3), values in [0,1].
+"""
+function save_ppm(filename::String, image::Array{T, 3}) where T
+    H, W, _ = size(image)
+    open(filename, "w") do f
+        println(f, "P3")
+        println(f, "$W $H")
+        println(f, "255")
+        for i in 1:H
+            for j in 1:W
+                r = round(Int, clamp(Float64(image[i, j, 1]), 0.0, 1.0) * 255)
+                g = round(Int, clamp(Float64(image[i, j, 2]), 0.0, 1.0) * 255)
+                b = round(Int, clamp(Float64(image[i, j, 3]), 0.0, 1.0) * 255)
+                print(f, "$r $g $b ")
+            end
+            println(f)
+        end
+    end
+    return filename
+end
+
+"""
+Save image as raw binary PPM (P6 format) — more compact.
+"""
+function save_ppm_binary(filename::String, image::Array{T, 3}) where T
+    H, W, _ = size(image)
+    open(filename, "w") do f
+        write(f, "P6\n$W $H\n255\n")
+        for i in 1:H
+            for j in 1:W
+                r = UInt8(round(Int, clamp(Float64(image[i, j, 1]), 0.0, 1.0) * 255))
+                g = UInt8(round(Int, clamp(Float64(image[i, j, 2]), 0.0, 1.0) * 255))
+                b = UInt8(round(Int, clamp(Float64(image[i, j, 3]), 0.0, 1.0) * 255))
+                write(f, r)
+                write(f, g)
+                write(f, b)
+            end
+        end
+    end
+    return filename
+end
+
+"""
+Convert render target to image array (H × W × 3, Float64 in [0,1]).
+"""
+function render_target_to_image(rt::RenderTarget)
+    return copy(rt.color)
+end
+
+"""
+Create a simple test pattern image for validation.
+"""
+function test_pattern(width::Int, height::Int)
+    img = Array{Float64}(undef, height, width, 3)
+    for j in 1:width
+        for i in 1:height
+            img[i, j, 1] = (j - 1) / (width - 1)    # red gradient horizontal
+            img[i, j, 2] = (i - 1) / (height - 1)    # green gradient vertical
+            img[i, j, 3] = 0.5                         # constant blue
+        end
+    end
+    return img
+end
+
+# --------------------------------------------------------------------------
+# Self-contained PNG and PDF export (no external image packages).
+# A render produces an H×W×3 array in [0,1]; these writers encode it to a
+# publication-grade PNG (8-bit RGB) or a single-page PDF (image XObject) with
+# only Base + Printf. PNG uses a valid zlib/DEFLATE stream built from stored
+# (uncompressed) blocks, so the files open in any standard viewer/LaTeX.
+# --------------------------------------------------------------------------
+
+@inline _be32(x::Integer) = UInt8[(x >> 24) & 0xff, (x >> 16) & 0xff, (x >> 8) & 0xff, x & 0xff]
+
+# Coerce an H×W×3 image (Float in [0,1] or UInt8) to a UInt8 RGB array.
+function image_to_uint8(img::AbstractArray)
+    eltype(img) === UInt8 && return img
+    H, W = size(img, 1), size(img, 2)
+    out = Array{UInt8}(undef, H, W, 3)
+    @inbounds for j in 1:W, i in 1:H, c in 1:3
+        out[i, j, c] = round(UInt8, clamp(Float64(img[i, j, c]), 0.0, 1.0) * 255)
+    end
+    return out
+end
+image_to_uint8(rt::RenderTarget) = image_to_uint8(rt.color)
+
+const _CRC32_TABLE = let tbl = Vector{UInt32}(undef, 256)
+    for n in 0:255
+        c = UInt32(n)
+        for _ in 1:8
+            c = (c & 0x00000001) != 0 ? (0xedb88320 ⊻ (c >> 1)) : (c >> 1)
+        end
+        tbl[n + 1] = c
+    end
+    tbl
+end
+
+function _crc32(data)
+    c = 0xffffffff
+    @inbounds for b in data
+        c = _CRC32_TABLE[((c ⊻ UInt32(b)) & 0xff) + 1] ⊻ (c >> 8)
+    end
+    return c ⊻ 0xffffffff
+end
+
+function _adler32(data)
+    a = UInt32(1)
+    b = UInt32(0)
+    @inbounds for byte in data
+        a = (a + UInt32(byte)) % 65521
+        b = (b + a) % 65521
+    end
+    return (b << 16) | a
+end
+
+# Wrap raw bytes in a zlib stream using DEFLATE stored (BTYPE=00) blocks.
+function _zlib_store(data::Vector{UInt8})
+    out = UInt8[]
+    push!(out, 0x78, 0x01)            # zlib header: CM=8, CINFO=7, FCHECK
+    n = length(data)
+    pos = 1
+    while pos <= n
+        block = min(65535, n - pos + 1)
+        final = (pos + block - 1) >= n
+        push!(out, final ? 0x01 : 0x00)
+        push!(out, UInt8(block & 0xff), UInt8((block >> 8) & 0xff))
+        nlen = UInt16(block) ⊻ 0xffff
+        push!(out, UInt8(nlen & 0xff), UInt8((nlen >> 8) & 0xff))
+        append!(out, @view data[pos:(pos + block - 1)])
+        pos += block
+    end
+    ad = _adler32(data)
+    append!(out, _be32(ad))           # Adler32, big-endian
+    return out
+end
+
+function _png_chunk(io::IO, ctype::String, data::Vector{UInt8})
+    write(io, _be32(length(data)))
+    tb = Vector{UInt8}(codeunits(ctype))
+    write(io, tb)
+    write(io, data)
+    write(io, _be32(_crc32(vcat(tb, data))))
+    return nothing
+end
+
+"""
+    save_png(filename, img)
+
+Write an H×W×3 image (Float in [0,1], UInt8, or a `RenderTarget`) as an 8-bit
+RGB PNG. Pure Julia; no external dependencies.
+"""
+function save_png(filename::String, img::AbstractArray)
+    buf = image_to_uint8(img)
+    H, W = size(buf, 1), size(buf, 2)
+    raw = Vector{UInt8}(undef, H * (1 + W * 3))
+    k = 1
+    @inbounds for i in 1:H
+        raw[k] = 0x00; k += 1                      # filter type 0 (None) per scanline
+        for j in 1:W
+            raw[k] = buf[i, j, 1]; k += 1
+            raw[k] = buf[i, j, 2]; k += 1
+            raw[k] = buf[i, j, 3]; k += 1
+        end
+    end
+    open(filename, "w") do io
+        write(io, UInt8[137, 80, 78, 71, 13, 10, 26, 10])   # PNG signature
+        ihdr = UInt8[]
+        append!(ihdr, _be32(W)); append!(ihdr, _be32(H))
+        push!(ihdr, 0x08, 0x02, 0x00, 0x00, 0x00)           # 8-bit, RGB, deflate, no filter/interlace
+        _png_chunk(io, "IHDR", ihdr)
+        _png_chunk(io, "IDAT", _zlib_store(raw))
+        _png_chunk(io, "IEND", UInt8[])
+    end
+    return filename
+end
+save_png(filename::String, rt::RenderTarget) = save_png(filename, rt.color)
+
+"""
+    save_png_rgba(filename, img)
+
+Write an H×W×4 image (Float in [0,1] or UInt8) as an 8-bit RGBA PNG (color type 6).
+"""
+function save_png_rgba(filename::String, img::AbstractArray)
+    H, W = size(img, 1), size(img, 2)
+    @assert size(img, 3) == 4 "save_png_rgba expects an H×W×4 image"
+    raw = Vector{UInt8}(undef, H * (1 + W * 4))
+    k = 1
+    @inbounds for i in 1:H
+        raw[k] = 0x00; k += 1                       # filter None
+        for j in 1:W, c in 1:4
+            raw[k] = eltype(img) === UInt8 ? img[i,j,c] :
+                     round(UInt8, clamp(Float64(img[i,j,c]), 0.0, 1.0) * 255); k += 1
+        end
+    end
+    open(filename, "w") do io
+        write(io, UInt8[137,80,78,71,13,10,26,10])
+        ihdr = UInt8[]; append!(ihdr, _be32(W)); append!(ihdr, _be32(H))
+        push!(ihdr, 0x08, 0x06, 0x00, 0x00, 0x00)   # 8-bit, RGBA
+        _png_chunk(io, "IHDR", ihdr)
+        _png_chunk(io, "IDAT", _zlib_store(raw))
+        _png_chunk(io, "IEND", UInt8[])
+    end
+    return filename
+end
+
+"""
+    save_png16(filename, img)
+
+Write a 16-bit grayscale PNG from an H×W (or H×W×1) image of values in [0,1].
+"""
+function save_png16(filename::String, img::AbstractArray)
+    gray = ndims(img) == 3 ? @view(img[:, :, 1]) : img
+    H, W = size(gray, 1), size(gray, 2)
+    raw = Vector{UInt8}(undef, H * (1 + W * 2))
+    k = 1
+    @inbounds for i in 1:H
+        raw[k] = 0x00; k += 1
+        for j in 1:W
+            v = round(UInt16, clamp(Float64(gray[i, j]), 0.0, 1.0) * 65535)
+            raw[k] = UInt8(v >> 8); raw[k+1] = UInt8(v & 0xff); k += 2   # big-endian
+        end
+    end
+    open(filename, "w") do io
+        write(io, UInt8[137,80,78,71,13,10,26,10])
+        ihdr = UInt8[]; append!(ihdr, _be32(W)); append!(ihdr, _be32(H))
+        push!(ihdr, 0x10, 0x00, 0x00, 0x00, 0x00)   # 16-bit grayscale
+        _png_chunk(io, "IHDR", ihdr)
+        _png_chunk(io, "IDAT", _zlib_store(raw))
+        _png_chunk(io, "IEND", UInt8[])
+    end
+    return filename
+end
+
+"""
+    save_pdf(filename, img; dpi=144)
+
+Write an H×W×3 image as a single-page PDF whose page holds the rendered frame
+as a DeviceRGB image XObject. Page size is `pixels / dpi` inches. Pure Julia.
+"""
+function save_pdf(filename::String, img::AbstractArray; dpi::Real=144)
+    buf = image_to_uint8(img)
+    H, W = size(buf, 1), size(buf, 2)
+    rgb = Vector{UInt8}(undef, H * W * 3)         # PDF image samples: top row first
+    k = 1
+    @inbounds for i in 1:H, j in 1:W
+        rgb[k] = buf[i, j, 1]; rgb[k + 1] = buf[i, j, 2]; rgb[k + 2] = buf[i, j, 3]; k += 3
+    end
+    pw = round(W / dpi * 72; digits=2)
+    ph = round(H / dpi * 72; digits=2)
+    content = Vector{UInt8}(codeunits("q $pw 0 0 $ph 0 0 cm /Im0 Do Q"))
+
+    io = IOBuffer()
+    off = Dict{Int,Int}()
+    write(io, "%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    off[1] = position(io); write(io, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    off[2] = position(io); write(io, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    off[3] = position(io); write(io, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 $pw $ph] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n")
+    off[4] = position(io)
+    write(io, "4 0 obj\n<< /Type /XObject /Subtype /Image /Width $W /Height $H /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length $(length(rgb)) >>\nstream\n")
+    write(io, rgb); write(io, "\nendstream\nendobj\n")
+    off[5] = position(io)
+    write(io, "5 0 obj\n<< /Length $(length(content)) >>\nstream\n")
+    write(io, content); write(io, "\nendstream\nendobj\n")
+    xref_pos = position(io)
+    write(io, "xref\n0 6\n0000000000 65535 f \n")
+    for n in 1:5
+        write(io, @sprintf("%010d 00000 n \n", off[n]))
+    end
+    write(io, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n$xref_pos\n%%EOF\n")
+    open(f -> write(f, take!(io)), filename, "w")
+    return filename
+end
+save_pdf(filename::String, rt::RenderTarget; kwargs...) = save_pdf(filename, rt.color; kwargs...)

@@ -1,0 +1,231 @@
+# --------------------------------------------------------------------------
+# Scene graph: Object3D, Scene, Group, Mesh, Line, Points
+# Mutable structs matching three.js API semantics.
+# --------------------------------------------------------------------------
+
+abstract type AbstractObject3D end
+
+mutable struct Object3D <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+end
+
+# Global ID counter
+const _OBJECT_ID_COUNTER = Ref(0)
+function _next_id()
+    _OBJECT_ID_COUNTER[] += 1
+    return _OBJECT_ID_COUNTER[]
+end
+
+function Object3D(; name="")
+    Object3D(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+             nothing, AbstractObject3D[], true, name, _next_id())
+end
+
+function add!(parent::AbstractObject3D, child::AbstractObject3D)
+    push!(get_children(parent), child)
+    set_parent!(child, parent)
+    return parent
+end
+
+function remove!(parent::AbstractObject3D, child::AbstractObject3D)
+    children = get_children(parent)
+    idx = findfirst(c -> c === child, children)
+    if idx !== nothing
+        deleteat!(children, idx)
+        set_parent!(child, nothing)
+    end
+    return parent
+end
+
+# Default accessors for Object3D fields — subtypes override via their own fields
+get_position(o::Object3D) = o.position
+get_rotation(o::Object3D) = o.rotation
+get_scale(o::Object3D) = o.scale
+get_children(o::Object3D) = o.children
+get_parent(o::Object3D) = o.parent
+is_visible(o::Object3D) = o.visible
+set_parent!(o::Object3D, p) = (o.parent = p)
+
+function compute_local_matrix(obj::AbstractObject3D)
+    pos = get_position(obj)
+    rot = get_rotation(obj)
+    scl = get_scale(obj)
+    q = quat_from_euler(rot.x, rot.y, rot.z; order=rot.order)
+    T = mat4_translation(pos.x, pos.y, pos.z)
+    R = quat_to_mat4(q)
+    S = mat4_scaling(scl.x, scl.y, scl.z)
+    T * R * S
+end
+
+function compute_world_matrix(obj::AbstractObject3D)
+    local_mat = compute_local_matrix(obj)
+    p = get_parent(obj)
+    if p === nothing
+        return local_mat
+    else
+        return compute_world_matrix(p) * local_mat
+    end
+end
+
+# ========================== Scene ==========================
+
+mutable struct Scene <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+    background::Color3{Float64}
+end
+
+function Scene(; background=Color3(0.0, 0.0, 0.0), name="Scene")
+    Scene(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+          nothing, AbstractObject3D[], true, name, _next_id(), background)
+end
+
+get_position(o::Scene) = o.position
+get_rotation(o::Scene) = o.rotation
+get_scale(o::Scene) = o.scale
+get_children(o::Scene) = o.children
+get_parent(o::Scene) = o.parent
+is_visible(o::Scene) = o.visible
+set_parent!(o::Scene, p) = (o.parent = p)
+
+# ========================== Group ==========================
+
+mutable struct Group <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+end
+
+function Group(; name="Group")
+    Group(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+          nothing, AbstractObject3D[], true, name, _next_id())
+end
+
+get_position(o::Group) = o.position
+get_rotation(o::Group) = o.rotation
+get_scale(o::Group) = o.scale
+get_children(o::Group) = o.children
+get_parent(o::Group) = o.parent
+is_visible(o::Group) = o.visible
+set_parent!(o::Group, p) = (o.parent = p)
+
+# ========================== Mesh ==========================
+
+mutable struct Mesh <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+    geometry::Any  # BufferGeometry
+    material::Any  # AbstractMaterial
+    flat_shading::Union{Nothing, Bool}  # nothing = follow renderer default; true/false = override
+end
+
+function Mesh(geometry, material; name="Mesh", flat_shading=nothing)
+    Mesh(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+         nothing, AbstractObject3D[], true, name, _next_id(),
+         geometry, material, flat_shading)
+end
+
+get_position(o::Mesh) = o.position
+get_rotation(o::Mesh) = o.rotation
+get_scale(o::Mesh) = o.scale
+get_children(o::Mesh) = o.children
+get_parent(o::Mesh) = o.parent
+is_visible(o::Mesh) = o.visible
+set_parent!(o::Mesh, p) = (o.parent = p)
+
+# ========================== Line ==========================
+
+mutable struct LineObject <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+    geometry::Any
+    material::Any
+end
+
+function LineObject(geometry, material; name="Line")
+    LineObject(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+              nothing, AbstractObject3D[], true, name, _next_id(),
+              geometry, material)
+end
+
+get_position(o::LineObject) = o.position
+get_rotation(o::LineObject) = o.rotation
+get_scale(o::LineObject) = o.scale
+get_children(o::LineObject) = o.children
+get_parent(o::LineObject) = o.parent
+is_visible(o::LineObject) = o.visible
+set_parent!(o::LineObject, p) = (o.parent = p)
+
+# ========================== Points ==========================
+
+mutable struct PointsObject <: AbstractObject3D
+    position::Vec3{Float64}
+    rotation::Euler{Float64}
+    scale::Vec3{Float64}
+    parent::Union{Nothing, AbstractObject3D}
+    children::Vector{AbstractObject3D}
+    visible::Bool
+    name::String
+    id::Int
+    geometry::Any
+    material::Any
+end
+
+function PointsObject(geometry, material; name="Points")
+    PointsObject(Vec3(), Euler(), Vec3(1.0, 1.0, 1.0),
+                 nothing, AbstractObject3D[], true, name, _next_id(),
+                 geometry, material)
+end
+
+get_position(o::PointsObject) = o.position
+get_rotation(o::PointsObject) = o.rotation
+get_scale(o::PointsObject) = o.scale
+get_children(o::PointsObject) = o.children
+get_parent(o::PointsObject) = o.parent
+is_visible(o::PointsObject) = o.visible
+set_parent!(o::PointsObject, p) = (o.parent = p)
+
+# ========================== Traversal ==========================
+
+function traverse(obj::AbstractObject3D, callback::Function)
+    callback(obj)
+    for child in get_children(obj)
+        traverse(child, callback)
+    end
+end
+
+function collect_meshes(scene::AbstractObject3D)
+    meshes = Mesh[]
+    traverse(scene, obj -> obj isa Mesh && push!(meshes, obj))
+    return meshes
+end

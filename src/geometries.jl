@@ -1,0 +1,555 @@
+# --------------------------------------------------------------------------
+# BufferGeometry and parametric geometry generators.
+# Vertex data stored as flat Float64 arrays; face indices as Int arrays.
+# --------------------------------------------------------------------------
+
+struct BufferAttribute{T}
+    data::Vector{T}
+    item_size::Int  # components per vertex (3 for position, 2 for uv, etc.)
+end
+
+mutable struct BufferGeometry
+    positions::Vector{Float64}   # flat: [x1,y1,z1, x2,y2,z2, ...]
+    normals::Vector{Float64}     # flat: [nx1,ny1,nz1, ...]
+    uvs::Vector{Float64}         # flat: [u1,v1, u2,v2, ...]
+    indices::Vector{Int}         # triangle face indices (1-based)
+    n_vertices::Int
+    n_faces::Int
+    attributes::Dict{Symbol, BufferAttribute}   # generic named attributes (e.g. :color, :tangent)
+end
+
+# Back-compatible constructor: position/normal/uv/index core, empty named attributes.
+BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces) =
+    BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces,
+                   Dict{Symbol, BufferAttribute}())
+
+function BufferGeometry()
+    BufferGeometry(Float64[], Float64[], Float64[], Int[], 0, 0)
+end
+
+"""Attach a generic named vertex attribute (three.js `setAttribute`)."""
+function set_attribute!(g::BufferGeometry, name::Symbol, data::Vector, item_size::Int)
+    g.attributes[name] = BufferAttribute(data, item_size)
+    return g
+end
+
+get_attribute(g::BufferGeometry, name::Symbol) = g.attributes[name]
+has_attribute(g::BufferGeometry, name::Symbol) = haskey(g.attributes, name)
+
+"""Axis-aligned bounding box of the geometry (three.js `computeBoundingBox`)."""
+function compute_bounding_box(g::BufferGeometry)
+    g.n_vertices == 0 && return Box3()
+    box = Box3()
+    @inbounds for vi in 1:g.n_vertices
+        box = box3_expand_by_point(box, get_vertex(g, vi))
+    end
+    return box
+end
+
+"""Bounding sphere centred on the box centre (three.js `computeBoundingSphere`)."""
+function compute_bounding_sphere(g::BufferGeometry)
+    g.n_vertices == 0 && return BoundingSphere(Vec3(), 0.0)
+    box = compute_bounding_box(g)
+    center = (box.min + box.max) * 0.5
+    r2 = 0.0
+    @inbounds for vi in 1:g.n_vertices
+        d = get_vertex(g, vi) - center
+        r2 = max(r2, dot(d, d))
+    end
+    return BoundingSphere(center, sqrt(r2))
+end
+
+function get_vertex(g::BufferGeometry, i::Int)
+    idx = (i - 1) * 3
+    Vec3(g.positions[idx+1], g.positions[idx+2], g.positions[idx+3])
+end
+
+function get_normal(g::BufferGeometry, i::Int)
+    idx = (i - 1) * 3
+    Vec3(g.normals[idx+1], g.normals[idx+2], g.normals[idx+3])
+end
+
+function get_face(g::BufferGeometry, i::Int)
+    idx = (i - 1) * 3
+    (g.indices[idx+1], g.indices[idx+2], g.indices[idx+3])
+end
+
+function compute_face_normal(g::BufferGeometry, face_idx::Int)
+    i1, i2, i3 = get_face(g, face_idx)
+    v1 = get_vertex(g, i1)
+    v2 = get_vertex(g, i2)
+    v3 = get_vertex(g, i3)
+    normalize(cross(v2 - v1, v3 - v1))
+end
+
+# ========================== Box Geometry ==========================
+
+function BoxGeometry(; width=1.0, height=1.0, depth=1.0)
+    w, h, d = width/2, height/2, depth/2
+
+    # 8 corners, 24 vertices (4 per face for proper normals)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+    vi = 0  # vertex counter
+
+    function add_face!(p1, p2, p3, p4, n)
+        for p in (p1, p2, p3, p4)
+            append!(positions, [p.x, p.y, p.z])
+            append!(normals_arr, [n.x, n.y, n.z])
+        end
+        append!(uvs_arr, [0,0, 1,0, 1,1, 0,1])
+        base = vi + 1
+        append!(indices, [base, base+1, base+2, base, base+2, base+3])
+        vi += 4
+    end
+
+    # +Z face
+    add_face!(Vec3(-w,-h,d), Vec3(w,-h,d), Vec3(w,h,d), Vec3(-w,h,d), Vec3(0,0,1))
+    # -Z face
+    add_face!(Vec3(w,-h,-d), Vec3(-w,-h,-d), Vec3(-w,h,-d), Vec3(w,h,-d), Vec3(0,0,-1))
+    # +Y face
+    add_face!(Vec3(-w,h,d), Vec3(w,h,d), Vec3(w,h,-d), Vec3(-w,h,-d), Vec3(0,1,0))
+    # -Y face
+    add_face!(Vec3(-w,-h,-d), Vec3(w,-h,-d), Vec3(w,-h,d), Vec3(-w,-h,d), Vec3(0,-1,0))
+    # +X face
+    add_face!(Vec3(w,-h,d), Vec3(w,-h,-d), Vec3(w,h,-d), Vec3(w,h,d), Vec3(1,0,0))
+    # -X face
+    add_face!(Vec3(-w,-h,-d), Vec3(-w,-h,d), Vec3(-w,h,d), Vec3(-w,h,-d), Vec3(-1,0,0))
+
+    n_verts = vi
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Sphere Geometry ==========================
+
+function SphereGeometry(; radius=1.0, width_segments=32, height_segments=16)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+
+    for j in 0:height_segments
+        v = j / height_segments
+        θ = v * π
+        for i in 0:width_segments
+            u = i / width_segments
+            ϕ = u * 2π
+
+            x = -radius * sin(θ) * cos(ϕ)
+            y = radius * cos(θ)
+            z = radius * sin(θ) * sin(ϕ)
+
+            nx, ny, nz = -sin(θ)*cos(ϕ), cos(θ), sin(θ)*sin(ϕ)
+            nl = sqrt(nx^2 + ny^2 + nz^2)
+            if nl > 0
+                nx /= nl; ny /= nl; nz /= nl
+            end
+
+            append!(positions, [x, y, z])
+            append!(normals_arr, [nx, ny, nz])
+            append!(uvs_arr, [u, 1.0-v])
+        end
+    end
+
+    for j in 0:height_segments-1
+        for i in 0:width_segments-1
+            a = j * (width_segments + 1) + i + 1
+            b = a + 1
+            c = a + (width_segments + 1)
+            d = c + 1
+
+            if j != 0
+                append!(indices, [a, d, b])
+            end
+            if j != height_segments - 1
+                append!(indices, [a, c, d])
+            end
+        end
+    end
+
+    n_verts = (height_segments + 1) * (width_segments + 1)
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Plane Geometry ==========================
+
+function PlaneGeometry(; width=1.0, height=1.0, width_segments=1, height_segments=1)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+
+    hw, hh = width/2, height/2
+    dw = width / width_segments
+    dh = height / height_segments
+
+    for iy in 0:height_segments
+        y = iy * dh - hh
+        for ix in 0:width_segments
+            x = ix * dw - hw
+            append!(positions, [x, -y, 0.0])
+            append!(normals_arr, [0.0, 0.0, 1.0])
+            append!(uvs_arr, [ix/width_segments, 1.0 - iy/height_segments])
+        end
+    end
+
+    for iy in 0:height_segments-1
+        for ix in 0:width_segments-1
+            a = iy * (width_segments + 1) + ix + 1
+            b = a + 1
+            c = a + (width_segments + 1)
+            d = c + 1
+            append!(indices, [a, d, b, a, c, d])
+        end
+    end
+
+    n_verts = (width_segments + 1) * (height_segments + 1)
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Cylinder Geometry ==========================
+
+function CylinderGeometry(; radius_top=1.0, radius_bottom=1.0, height=1.0,
+                           radial_segments=32, height_segments=1, open_ended=false)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+    vi = 0
+
+    half_h = height / 2
+    slope = (radius_bottom - radius_top) / height
+
+    # Side
+    for y_seg in 0:height_segments
+        v = y_seg / height_segments
+        r = v * (radius_bottom - radius_top) + radius_top
+        y_pos = v * height - half_h
+
+        for x_seg in 0:radial_segments
+            u = x_seg / radial_segments
+            θ = u * 2π
+
+            x = r * sin(θ)
+            z = r * cos(θ)
+
+            nx = sin(θ)
+            ny = slope
+            nz = cos(θ)
+            nl = sqrt(nx^2 + ny^2 + nz^2)
+            nx /= nl; ny /= nl; nz /= nl
+
+            append!(positions, [x, y_pos, z])
+            append!(normals_arr, [nx, ny, nz])
+            append!(uvs_arr, [u, 1.0 - v])
+            vi += 1
+        end
+    end
+
+    for y_seg in 0:height_segments-1
+        for x_seg in 0:radial_segments-1
+            a = y_seg * (radial_segments + 1) + x_seg + 1
+            b = a + 1
+            c = a + (radial_segments + 1)
+            d = c + 1
+            append!(indices, [a, b, d, a, d, c])
+        end
+    end
+
+    # Caps
+    if !open_ended
+        for (cap_y, cap_r, cap_ny) in [(half_h, radius_top, 1.0), (-half_h, radius_bottom, -1.0)]
+            center_idx = vi + 1
+            append!(positions, [0.0, cap_y, 0.0])
+            append!(normals_arr, [0.0, cap_ny, 0.0])
+            append!(uvs_arr, [0.5, 0.5])
+            vi += 1
+
+            for x_seg in 0:radial_segments
+                u = x_seg / radial_segments
+                θ = u * 2π
+                x = cap_r * sin(θ)
+                z = cap_r * cos(θ)
+
+                append!(positions, [x, cap_y, z])
+                append!(normals_arr, [0.0, cap_ny, 0.0])
+                append!(uvs_arr, [sin(θ)*0.5+0.5, cos(θ)*0.5+0.5])
+                vi += 1
+            end
+
+            for x_seg in 0:radial_segments-1
+                curr = center_idx + 1 + x_seg
+                next_v = curr + 1
+                if cap_ny > 0
+                    append!(indices, [center_idx, next_v, curr])
+                else
+                    append!(indices, [center_idx, curr, next_v])
+                end
+            end
+        end
+    end
+
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, vi, n_faces)
+end
+
+# ========================== Cone Geometry ==========================
+
+function ConeGeometry(; radius=1.0, height=1.0, radial_segments=32, height_segments=1,
+                       open_ended=false)
+    CylinderGeometry(; radius_top=0.0, radius_bottom=radius, height=height,
+                      radial_segments=radial_segments, height_segments=height_segments,
+                      open_ended=open_ended)
+end
+
+# ========================== Torus Geometry ==========================
+
+function TorusGeometry(; radius=1.0, tube=0.4, radial_segments=16, tubular_segments=48)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+
+    for j in 0:radial_segments
+        for i in 0:tubular_segments
+            u = i / tubular_segments * 2π
+            v = j / radial_segments * 2π
+
+            x = (radius + tube * cos(v)) * cos(u)
+            y = (radius + tube * cos(v)) * sin(u)
+            z = tube * sin(v)
+
+            cx = radius * cos(u)
+            cy = radius * sin(u)
+            nx = x - cx
+            ny = y - cy
+            nz = z
+            nl = sqrt(nx^2 + ny^2 + nz^2)
+            if nl > 0
+                nx /= nl; ny /= nl; nz /= nl
+            end
+
+            append!(positions, [x, y, z])
+            append!(normals_arr, [nx, ny, nz])
+            append!(uvs_arr, [i/tubular_segments, j/radial_segments])
+        end
+    end
+
+    for j in 1:radial_segments
+        for i in 1:tubular_segments
+            a = (j - 1) * (tubular_segments + 1) + i
+            b = a + 1
+            c = j * (tubular_segments + 1) + i
+            d = c + 1
+            append!(indices, [a, b, d, a, d, c])
+        end
+    end
+
+    n_verts = (radial_segments + 1) * (tubular_segments + 1)
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== TorusKnot Geometry ==========================
+
+function TorusKnotGeometry(; radius=1.0, tube=0.4, tubular_segments=64,
+                            radial_segments=8, p_val=2, q_val=3)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+
+    function knot_point(t)
+        cu = cos(t)
+        su = sin(t)
+        qu_over_p = q_val / p_val * t
+        cx = radius * (2 + cos(qu_over_p)) * cu * 0.5
+        cy = radius * (2 + cos(qu_over_p)) * su * 0.5
+        cz = radius * sin(qu_over_p) * 0.5
+        Vec3(cx, cy, cz)
+    end
+
+    for i in 0:tubular_segments
+        u = i / tubular_segments * p_val * 2π
+        p1 = knot_point(u)
+        p2 = knot_point(u + 0.01)
+        T_vec = normalize(p2 - p1)
+        N_vec = normalize(p2 + p1)
+        B_vec = normalize(cross(T_vec, N_vec))
+        N_vec = cross(B_vec, T_vec)
+
+        for j in 0:radial_segments
+            v = j / radial_segments * 2π
+            cx = tube * cos(v)
+            cy = tube * sin(v)
+            px = p1.x + cx * N_vec.x + cy * B_vec.x
+            py = p1.y + cx * N_vec.y + cy * B_vec.y
+            pz = p1.z + cx * N_vec.z + cy * B_vec.z
+
+            nx = px - p1.x
+            ny = py - p1.y
+            nz = pz - p1.z
+            nl = sqrt(nx^2 + ny^2 + nz^2)
+            if nl > 0
+                nx /= nl; ny /= nl; nz /= nl
+            end
+
+            append!(positions, [px, py, pz])
+            append!(normals_arr, [nx, ny, nz])
+            append!(uvs_arr, [i/tubular_segments, j/radial_segments])
+        end
+    end
+
+    for i in 1:tubular_segments
+        for j in 1:radial_segments
+            a = (i - 1) * (radial_segments + 1) + j
+            b = a + 1
+            c = i * (radial_segments + 1) + j
+            d = c + 1
+            append!(indices, [a, b, d, a, d, c])
+        end
+    end
+
+    n_verts = (tubular_segments + 1) * (radial_segments + 1)
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Ring Geometry ==========================
+
+function RingGeometry(; inner_radius=0.5, outer_radius=1.0, theta_segments=32, phi_segments=1)
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+
+    for j in 0:phi_segments
+        v = j / phi_segments
+        r = inner_radius + v * (outer_radius - inner_radius)
+        for i in 0:theta_segments
+            u = i / theta_segments
+            θ = u * 2π
+            x = r * cos(θ)
+            y = r * sin(θ)
+            append!(positions, [x, y, 0.0])
+            append!(normals_arr, [0.0, 0.0, 1.0])
+            append!(uvs_arr, [u, v])
+        end
+    end
+
+    for j in 0:phi_segments-1
+        for i in 0:theta_segments-1
+            a = j * (theta_segments + 1) + i + 1
+            b = a + 1
+            c = a + (theta_segments + 1)
+            d = c + 1
+            append!(indices, [a, d, b, a, c, d])
+        end
+    end
+
+    n_verts = (phi_segments + 1) * (theta_segments + 1)
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Circle Geometry ==========================
+
+function CircleGeometry(; radius=1.0, segments=32)
+    positions = Float64[0.0, 0.0, 0.0]  # center
+    normals_arr = Float64[0.0, 0.0, 1.0]
+    uvs_arr = Float64[0.5, 0.5]
+    indices = Int[]
+
+    for i in 0:segments
+        θ = i / segments * 2π
+        x = radius * cos(θ)
+        y = radius * sin(θ)
+        append!(positions, [x, y, 0.0])
+        append!(normals_arr, [0.0, 0.0, 1.0])
+        append!(uvs_arr, [cos(θ)*0.5+0.5, sin(θ)*0.5+0.5])
+    end
+
+    for i in 1:segments
+        append!(indices, [1, i+1, i+2])
+    end
+
+    n_verts = segments + 2
+    n_faces = length(indices) ÷ 3
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, n_verts, n_faces)
+end
+
+# ========================== Icosahedron Geometry ==========================
+
+function IcosahedronGeometry(; radius=1.0, detail=0)
+    t = (1 + sqrt(5)) / 2
+
+    raw_verts = [
+        Vec3(-1,  t,  0), Vec3( 1,  t,  0), Vec3(-1, -t,  0), Vec3( 1, -t,  0),
+        Vec3( 0, -1,  t), Vec3( 0,  1,  t), Vec3( 0, -1, -t), Vec3( 0,  1, -t),
+        Vec3( t,  0, -1), Vec3( t,  0,  1), Vec3(-t,  0, -1), Vec3(-t,  0,  1)
+    ]
+    raw_verts = [normalize(v) * radius for v in raw_verts]
+
+    raw_faces = [
+        (1,12,6), (1,6,2), (1,2,8), (1,8,11), (1,11,12),
+        (2,6,10), (6,12,5), (12,11,3), (11,8,7), (8,2,9),
+        (4,10,5), (4,5,3), (4,3,7), (4,7,9), (4,9,10),
+        (10,6,5), (5,12,3), (3,11,7), (7,8,9), (9,2,10)
+    ]
+
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices_arr = Int[]
+
+    for (idx, v) in enumerate(raw_verts)
+        append!(positions, [v.x, v.y, v.z])
+        n = normalize(v)
+        append!(normals_arr, [n.x, n.y, n.z])
+        append!(uvs_arr, [0.0, 0.0])
+    end
+
+    for (i1, i2, i3) in raw_faces
+        append!(indices_arr, [i1, i2, i3])
+    end
+
+    n_verts = length(raw_verts)
+    n_faces = length(raw_faces)
+    BufferGeometry(positions, normals_arr, uvs_arr, indices_arr, n_verts, n_faces)
+end
+
+# ========================== Utility ==========================
+
+function count_triangles(g::BufferGeometry)
+    g.n_faces
+end
+
+"""Merge multiple BufferGeometry objects into one (for batching)."""
+function merge_geometries(geos::Vector{BufferGeometry})
+    positions = Float64[]
+    normals_arr = Float64[]
+    uvs_arr = Float64[]
+    indices = Int[]
+    offset = 0
+    total_verts = 0
+    total_faces = 0
+
+    for g in geos
+        append!(positions, g.positions)
+        append!(normals_arr, g.normals)
+        append!(uvs_arr, g.uvs)
+        for idx in g.indices
+            push!(indices, idx + offset)
+        end
+        offset += g.n_vertices
+        total_verts += g.n_vertices
+        total_faces += g.n_faces
+    end
+
+    BufferGeometry(positions, normals_arr, uvs_arr, indices, total_verts, total_faces)
+end

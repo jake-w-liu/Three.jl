@@ -1,0 +1,440 @@
+#!/usr/bin/env julia
+# --------------------------------------------------------------------------
+# Three.jl — Heuristic Validation Experiments
+#
+# Generates:
+#   paper/data/inverse_rendering_convergence.csv
+#   paper/data/gradient_accuracy.csv
+#   paper/data/scalability_render_time.csv
+#   paper/figs/heuristic_convergence.pdf  (via PlotlySupply)
+#   paper/figs/heuristic_gradient_accuracy.pdf
+#   paper/figs/heuristic_scalability.pdf
+# --------------------------------------------------------------------------
+
+using Pkg
+# Activate Three.jl
+Pkg.activate(joinpath(@__DIR__, ".."))
+Pkg.instantiate()
+
+using Three
+using ForwardDiff
+using Printf
+using Random
+using LinearAlgebra: norm as la_norm
+
+# Also need PlotlySupply for paper figures
+plotly_path = joinpath(@__DIR__, "..", "..", "PlotlySupply.jl")
+if isdir(plotly_path)
+    Pkg.develop(path=plotly_path)
+end
+
+using PlotlySupply
+
+Random.seed!(42)
+
+const PAPER_DATA = joinpath(@__DIR__, "..", "..", "paper", "data")
+const PAPER_FIGS = joinpath(@__DIR__, "..", "..", "paper", "figs")
+mkpath(PAPER_DATA)
+mkpath(PAPER_FIGS)
+
+# Wong colorblind palette
+const COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7"]
+const DASHES = ["solid", "dash", "dashdot", "dot"]
+const IEEE_W = 504
+const IEEE_H = 360
+
+# ============================================================
+# Experiment 1: Inverse Rendering Convergence
+# Optimize camera position to match a target rendering.
+# ============================================================
+
+function experiment_inverse_convergence()
+    println("=" ^ 60)
+    println("Experiment 1: Inverse Rendering Convergence")
+    println("=" ^ 60)
+
+    W, H = 32, 32
+
+    # Scene setup: a red cube under directional light
+    # T is derived from the camera position arguments for AD compatibility
+    function make_scene_render(cam_pos_x, cam_pos_y, cam_pos_z)
+        T = promote_type(typeof(cam_pos_x), typeof(cam_pos_y), typeof(cam_pos_z))
+
+        # Box geometry (Float64 — not differentiated)
+        box = BoxGeometry(width=1.0, height=1.0, depth=1.0)
+
+        verts = Vec3{T}[]
+        faces_arr = NTuple{3,Int}[]
+        face_colors = Color3{T}[]
+
+        for vi in 1:box.n_vertices
+            px = T(box.positions[(vi-1)*3+1])
+            py = T(box.positions[(vi-1)*3+2])
+            pz = T(box.positions[(vi-1)*3+3])
+            push!(verts, Vec3(px, py, pz))
+        end
+        for fi in 1:box.n_faces
+            i1, i2, i3 = get_face(box, fi)
+            push!(faces_arr, (i1, i2, i3))
+
+            fn = compute_face_normal(box, fi)
+            light_dir = normalize(Vec3(1.0, 1.0, 1.0))
+            ndotl = max(dot(fn, light_dir), 0.0)
+            c = Color3(T(0.8 * ndotl + 0.2), T(0.2 * ndotl + 0.1), T(0.2 * ndotl + 0.1))
+            push!(face_colors, c)
+        end
+
+        eye = Vec3(cam_pos_x, cam_pos_y, cam_pos_z)
+        vp = mat4_perspective(T(π/4), one(T), T(0.1), T(100)) *
+             mat4_look_at(eye, Vec3(zero(T), zero(T), zero(T)),
+                          Vec3(zero(T), one(T), zero(T)))
+
+        config = SoftRasterizerConfig(sigma=T(0.5), gamma=T(1.0),
+                                       bg_color=Color3(zero(T), zero(T), zero(T)),
+                                       eps=T(1e-8))
+        soft_render(verts, faces_arr, face_colors, vp, W, H, config)
+    end
+
+    # Target: camera at (2, 2, 3)
+    target_img = make_scene_render(2.0, 2.0, 3.0)
+    println("  Target image generated (cam at [2, 2, 3])")
+
+    # Run 3 optimization tasks from different initial positions
+    tasks = [
+        ("Camera pose (easy)", [2.5, 2.5, 3.5]),
+        ("Camera pose (medium)", [3.0, 1.0, 4.0]),
+        ("Camera pose (hard)", [0.5, 3.5, 5.0]),
+    ]
+
+    all_histories = Dict{String, Vector{Float64}}()
+    n_iters = 80
+
+    for (task_name, init_params) in tasks
+        println("  Task: $task_name, init=$(init_params)")
+        params = Float64.(init_params)
+        loss_history = Float64[]
+
+        for iter in 1:n_iters
+            function obj(p)
+                img = make_scene_render(p[1], p[2], p[3])
+                loss_mse(img, target_img)
+            end
+
+            current_loss = obj(params)
+            push!(loss_history, current_loss)
+            grad = ForwardDiff.gradient(obj, params)
+
+            # Gradient descent with line search
+            lr = 0.5
+            params .-= lr .* grad
+
+            if iter % 20 == 0
+                println("    Iter $iter: loss = $(@sprintf("%.6e", current_loss))")
+            end
+        end
+        all_histories[task_name] = loss_history
+    end
+
+    # Save CSV
+    csv_file = joinpath(PAPER_DATA, "inverse_rendering_convergence.csv")
+    open(csv_file, "w") do f
+        println(f, "# Inverse rendering convergence: camera pose optimization")
+        println(f, "iteration,loss_easy,loss_medium,loss_hard")
+        for i in 1:n_iters
+            l1 = all_histories["Camera pose (easy)"][i]
+            l2 = all_histories["Camera pose (medium)"][i]
+            l3 = all_histories["Camera pose (hard)"][i]
+            println(f, "$i,$(@sprintf("%.15e", l1)),$(@sprintf("%.15e", l2)),$(@sprintf("%.15e", l3))")
+        end
+    end
+    println("  CSV saved: $csv_file")
+
+    return all_histories
+end
+
+# ============================================================
+# Experiment 2: Gradient Accuracy (AD vs Finite Differences)
+# ============================================================
+
+function experiment_gradient_accuracy()
+    println("=" ^ 60)
+    println("Experiment 2: Gradient Accuracy (AD vs FD)")
+    println("=" ^ 60)
+
+    W, H = 16, 16
+
+    function render_fn(params)
+        T = eltype(params)
+        verts = [Vec3(T(-0.5), T(-0.5), zero(T)),
+                 Vec3(T(0.5), T(-0.5), zero(T)),
+                 Vec3(T(0.5), T(0.5), zero(T)),
+                 Vec3(T(-0.5), T(0.5), zero(T))]
+        faces_arr = [(1,2,3), (1,3,4)]
+        colors = [Color3(one(T), T(0.3), T(0.1)), Color3(T(0.1), T(0.3), one(T))]
+
+        eye = Vec3(params[1], params[2], params[3])
+        vp = mat4_perspective(T(π/4), one(T), T(0.1), T(100)) *
+             mat4_look_at(eye, Vec3(zero(T), zero(T), zero(T)),
+                          Vec3(zero(T), one(T), zero(T)))
+        config = SoftRasterizerConfig(sigma=T(0.5), gamma=T(1.0),
+                                       bg_color=Color3(zero(T), zero(T), zero(T)),
+                                       eps=T(1e-8))
+        img = soft_render(verts, faces_arr, colors, vp, W, H, config)
+        return sum(img)
+    end
+
+    base_params = [0.0, 0.0, 3.0]
+
+    # AD gradient
+    ad_grad = ForwardDiff.gradient(render_fn, base_params)
+    println("  AD gradient: $ad_grad")
+
+    # FD at various step sizes
+    deltas = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
+    results = []
+
+    for δ in deltas
+        fd_grad = numerical_gradient(render_fn, base_params; δ=δ)
+        rel_errors = Float64[]
+        for i in 1:3
+            if abs(ad_grad[i]) > 1e-15
+                push!(rel_errors, abs(fd_grad[i] - ad_grad[i]) / abs(ad_grad[i]))
+            else
+                push!(rel_errors, abs(fd_grad[i] - ad_grad[i]))
+            end
+        end
+        avg_rel_err = sum(rel_errors) / length(rel_errors)
+        push!(results, (δ, avg_rel_err, fd_grad))
+        println("  δ=$(@sprintf("%.0e", δ)): avg rel error = $(@sprintf("%.3e", avg_rel_err))")
+    end
+
+    # Save CSV
+    csv_file = joinpath(PAPER_DATA, "gradient_accuracy.csv")
+    open(csv_file, "w") do f
+        println(f, "# Gradient accuracy: AD (ForwardDiff) vs finite differences")
+        println(f, "perturbation_delta,avg_relative_error,fd_grad_x,fd_grad_y,fd_grad_z,ad_grad_x,ad_grad_y,ad_grad_z")
+        for (δ, err, fdg) in results
+            println(f, "$(@sprintf("%.15e", δ)),$(@sprintf("%.15e", err))," *
+                       "$(@sprintf("%.15e", fdg[1])),$(@sprintf("%.15e", fdg[2])),$(@sprintf("%.15e", fdg[3]))," *
+                       "$(@sprintf("%.15e", ad_grad[1])),$(@sprintf("%.15e", ad_grad[2])),$(@sprintf("%.15e", ad_grad[3]))")
+        end
+    end
+    println("  CSV saved: $csv_file")
+
+    return results, ad_grad
+end
+
+# ============================================================
+# Experiment 3: Scalability — Render Time vs Triangle Count
+# ============================================================
+
+function experiment_scalability()
+    println("=" ^ 60)
+    println("Experiment 3: Scalability (render time vs triangles)")
+    println("=" ^ 60)
+
+    W, H = 64, 64
+    n_repeats = 5
+
+    # Generate scenes of increasing complexity
+    segment_counts = [4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
+    results = []
+
+    for segs in segment_counts
+        geo = SphereGeometry(radius=1.0, width_segments=segs, height_segments=segs÷2)
+        n_tris = geo.n_faces
+        mat = MeshPhongMaterial(color=Color3(0.6, 0.3, 0.8))
+
+        scene = Scene(background=Color3(0.05, 0.05, 0.05))
+        mesh = Mesh(geo, mat)
+        add!(scene, mesh)
+        light = DirectionalLight(position=Vec3(3.0, 3.0, 3.0))
+        add!(scene, light)
+        ambient = AmbientLight(intensity=0.2)
+        add!(scene, ambient)
+
+        cam = PerspectiveCamera(fov=π/4, aspect=1.0)
+        cam.position = Vec3(0.0, 0.0, 3.0)
+
+        rt = RenderTarget(W, H)
+
+        # Warmup
+        render!(rt, scene, cam)
+
+        # Timed runs
+        times = Float64[]
+        for _ in 1:n_repeats
+            t = @elapsed render!(rt, scene, cam)
+            push!(times, t * 1000)  # ms
+        end
+
+        median_t = sort(times)[n_repeats÷2 + 1]
+        mean_t = sum(times) / n_repeats
+        std_t = sqrt(sum((t - mean_t)^2 for t in times) / (n_repeats - 1))
+
+        push!(results, (n_tris, median_t, mean_t, std_t))
+        println("  $n_tris triangles: median=$(@sprintf("%.2f", median_t)) ms, " *
+                "mean=$(@sprintf("%.2f", mean_t)) ± $(@sprintf("%.2f", std_t)) ms")
+    end
+
+    # Also measure soft rasterizer scalability
+    soft_results = []
+    soft_segs = [4, 8, 16, 32, 48]  # fewer since soft is slower
+
+    for segs in soft_segs
+        geo = SphereGeometry(radius=1.0, width_segments=segs, height_segments=segs÷2)
+        n_tris = geo.n_faces
+
+        verts = Vec3{Float64}[]
+        faces_arr = NTuple{3,Int}[]
+        face_colors = Color3{Float64}[]
+        for vi in 1:geo.n_vertices
+            push!(verts, get_vertex(geo, vi))
+        end
+        for fi in 1:geo.n_faces
+            push!(faces_arr, get_face(geo, fi))
+            fn = compute_face_normal(geo, fi)
+            ndl = max(dot(fn, normalize(Vec3(1.0,1.0,1.0))), 0.0)
+            push!(face_colors, Color3(0.6*ndl+0.1, 0.3*ndl+0.1, 0.8*ndl+0.1))
+        end
+
+        vp = mat4_perspective(π/4, 1.0, 0.1, 100.0) *
+             mat4_look_at(Vec3(0,0,3), Vec3(0,0,0), Vec3(0,1,0))
+        config = SoftRasterizerConfig(sigma=0.01, gamma=0.01)
+
+        # Warmup
+        soft_render(verts, faces_arr, face_colors, vp, 32, 32, config)
+
+        times = Float64[]
+        for _ in 1:n_repeats
+            t = @elapsed soft_render(verts, faces_arr, face_colors, vp, 32, 32, config)
+            push!(times, t * 1000)
+        end
+
+        median_t = sort(times)[n_repeats÷2 + 1]
+        mean_t = sum(times) / n_repeats
+        std_t = sqrt(sum((t - mean_t)^2 for t in times) / (n_repeats - 1))
+
+        push!(soft_results, (n_tris, median_t, mean_t, std_t))
+        println("  Soft $n_tris triangles: median=$(@sprintf("%.2f", median_t)) ms")
+    end
+
+    # Save CSV
+    csv_file = joinpath(PAPER_DATA, "scalability_render_time.csv")
+    open(csv_file, "w") do f
+        println(f, "# Scalability: render time vs triangle count")
+        println(f, "n_triangles,hard_raster_median_ms,hard_raster_mean_ms,hard_raster_std_ms")
+        for (nt, med, mn, sd) in results
+            println(f, "$nt,$(@sprintf("%.15e", med)),$(@sprintf("%.15e", mn)),$(@sprintf("%.15e", sd))")
+        end
+    end
+
+    csv_file2 = joinpath(PAPER_DATA, "scalability_soft_render_time.csv")
+    open(csv_file2, "w") do f
+        println(f, "# Scalability: soft rasterizer time vs triangle count")
+        println(f, "n_triangles,soft_raster_median_ms,soft_raster_mean_ms,soft_raster_std_ms")
+        for (nt, med, mn, sd) in soft_results
+            println(f, "$nt,$(@sprintf("%.15e", med)),$(@sprintf("%.15e", mn)),$(@sprintf("%.15e", sd))")
+        end
+    end
+
+    println("  CSVs saved")
+    return results, soft_results
+end
+
+# ============================================================
+# Plot Generation (PlotlySupply)
+# ============================================================
+
+function generate_plots(convergence_data, gradient_data, scalability_data)
+    println("=" ^ 60)
+    println("Generating PlotlySupply figures")
+    println("=" ^ 60)
+
+    grad_results, ad_grad = gradient_data
+    hard_results, soft_results = scalability_data
+
+    # --- Plot 1: Inverse rendering convergence ---
+    iters = collect(1:length(first(values(convergence_data))))
+    losses_easy = convergence_data["Camera pose (easy)"]
+    losses_medium = convergence_data["Camera pose (medium)"]
+    losses_hard = convergence_data["Camera pose (hard)"]
+
+    fig1 = plot_scatter(iters, losses_easy;
+        xlabel="Iteration", ylabel="MSE Loss",
+        mode="lines", color=COLORS[1], dash=DASHES[1],
+        legend="Easy init", linewidth=2, fontsize=12,
+        yscale="log")
+    plot_scatter!(fig1, iters, losses_medium;
+        color=COLORS[2], dash=DASHES[2], mode="lines",
+        legend="Medium init", linewidth=2)
+    plot_scatter!(fig1, iters, losses_hard;
+        color=COLORS[3], dash=DASHES[3], mode="lines",
+        legend="Hard init", linewidth=2)
+    # Least-obstructive legend: topright (convergence curves decrease, leaving top-right clear)
+    set_legend!(fig1; position=:topright)
+    savefig(fig1, joinpath(PAPER_FIGS, "heuristic_convergence.pdf");
+            width=IEEE_W, height=IEEE_H)
+    println("  Saved heuristic_convergence.pdf")
+
+    # --- Plot 2: Gradient accuracy ---
+    deltas = [r[1] for r in grad_results]
+    errors = [r[2] for r in grad_results]
+
+    fig2 = plot_scatter(deltas, errors;
+        xlabel=raw"FD Perturbation $\delta$",
+        ylabel="Average Relative Error",
+        mode="lines+markers", color=COLORS[1], dash=DASHES[1],
+        legend="AD vs FD", linewidth=2, fontsize=12,
+        xscale="log", yscale="log", marker_size=6)
+    # Least-obstructive legend: topright (error curve generally has min in middle)
+    set_legend!(fig2; position=:topleft)
+    savefig(fig2, joinpath(PAPER_FIGS, "heuristic_gradient_accuracy.pdf");
+            width=IEEE_W, height=IEEE_H)
+    println("  Saved heuristic_gradient_accuracy.pdf")
+
+    # --- Plot 3: Scalability ---
+    hard_tris = [r[1] for r in hard_results]
+    hard_times = [r[2] for r in hard_results]
+    soft_tris = [r[1] for r in soft_results]
+    soft_times = [r[2] for r in soft_results]
+
+    fig3 = plot_scatter(hard_tris, hard_times;
+        xlabel="Number of Triangles",
+        ylabel="Render Time [ms]",
+        mode="lines+markers", color=COLORS[1], dash=DASHES[1],
+        legend="Hard rasterizer", linewidth=2, fontsize=12,
+        marker_size=6)
+    plot_scatter!(fig3, soft_tris, soft_times;
+        color=COLORS[2], dash=DASHES[2], mode="lines+markers",
+        legend="Soft rasterizer", linewidth=2, marker_size=6)
+    # Least-obstructive legend: topleft (times increase toward right)
+    set_legend!(fig3; position=:topleft)
+    savefig(fig3, joinpath(PAPER_FIGS, "heuristic_scalability.pdf");
+            width=IEEE_W, height=IEEE_H)
+    println("  Saved heuristic_scalability.pdf")
+end
+
+# ============================================================
+# Main
+# ============================================================
+
+function main()
+    println("Three.jl — Heuristic Validation Experiments")
+    println("=" ^ 60)
+
+    conv_data = experiment_inverse_convergence()
+    grad_data = experiment_gradient_accuracy()
+    scale_data = experiment_scalability()
+
+    generate_plots(conv_data, grad_data, scale_data)
+
+    println()
+    println("=" ^ 60)
+    println("All experiments complete.")
+    println("  CSV files in: $PAPER_DATA")
+    println("  Figures in:   $PAPER_FIGS")
+    println("=" ^ 60)
+end
+
+main()
