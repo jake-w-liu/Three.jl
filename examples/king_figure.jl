@@ -31,9 +31,14 @@ end
 function build_scene()
     scene = Scene(background = Color3(0.06, 0.07, 0.10))
 
-    # Ground plane (Lambert), laid flat: PlaneGeometry normal is +Z, rotate to +Y.
-    ground = Mesh(PlaneGeometry(width = 24.0, height = 24.0, width_segments = 1, height_segments = 1),
-                  MeshLambertMaterial(color = Color3(0.55, 0.57, 0.62)); name = "ground")
+    # Ground plane, laid flat (PlaneGeometry normal is +Z, rotate to +Y), with a
+    # checkerboard albedo texture (UV-mapped, per-pixel sampled) that also receives
+    # the cast shadows.
+    ground = Mesh(PlaneGeometry(width = 24.0, height = 24.0, width_segments = 24, height_segments = 24),
+                  MeshStandardMaterial(color = Color3(1.0, 1.0, 1.0), metalness = 0.0, roughness = 0.92,
+                                       map = checker_texture(n = 12, cell = 12,
+                                             a = Color3(0.60, 0.62, 0.67),
+                                             b = Color3(0.34, 0.36, 0.42))); name = "ground")
     ground.rotation = Euler(-π/2, 0.0, 0.0)
     ground.position = Vec3(0.0, 0.0, 0.0)
     add!(scene, ground)
@@ -45,9 +50,12 @@ function build_scene()
     sphere.position = Vec3(-2.3, 1.0, 0.0)
     add!(scene, sphere)
 
-    # Diffuse box — Lambert.
+    # Textured box — checkerboard albedo over a PBR base.
     box = Mesh(BoxGeometry(width = 1.5, height = 1.5, depth = 1.5),
-               MeshLambertMaterial(color = Color3(0.80, 0.25, 0.20)); name = "box")
+               MeshStandardMaterial(color = Color3(1.0, 1.0, 1.0), metalness = 0.0, roughness = 0.6,
+                                    map = checker_texture(n = 4, cell = 16,
+                                          a = Color3(0.85, 0.30, 0.22),
+                                          b = Color3(0.95, 0.82, 0.32))); name = "box")
     box.position = Vec3(0.2, 0.75, -1.7)
     box.rotation = Euler(0.0, π/6, 0.0)
     add!(scene, box)
@@ -77,6 +85,7 @@ function build_scene()
     add!(scene, AmbientLight(color = Color3(1.0, 1.0, 1.0), intensity = 0.28))
     key  = DirectionalLight(color = Color3(1.0, 0.96, 0.88), intensity = 0.95, position = Vec3(5.0, 8.0, 5.0))
     key.target = Vec3(0.0, 0.5, 0.0)
+    key.cast_shadow = true       # key light casts shadows onto the textured ground
     add!(scene, key)
     back = DirectionalLight(color = Color3(0.55, 0.65, 1.0), intensity = 0.55, position = Vec3(-6.0, 4.0, -4.0))
     back.target = Vec3(0.0, 0.5, 0.0)
@@ -94,13 +103,13 @@ function main()
     scene = build_scene()
     tri = sum(count_triangles(m.geometry) for m in collect_meshes(scene))
 
-    cam = PerspectiveCamera(fov = π/5, aspect = W / H, near = 0.1, far = 100.0)
-    cam.position = Vec3(4.2, 3.4, 6.6)
-    cam.target = Vec3(0.0, 0.7, 0.0)
+    cam = PerspectiveCamera(fov = π/4.6, aspect = W / H, near = 0.1, far = 100.0)
+    cam.position = Vec3(5.0, 4.0, 7.7)
+    cam.target = Vec3(0.2, 0.7, 0.2)
 
     rt = RenderTarget(W * ss, H * ss)
     @info "Rendering king scene" triangles=tri pixels="$(W*ss)x$(H*ss)"
-    t = @elapsed render!(rt, scene, cam; shading = :flat)
+    t = @elapsed render!(rt, scene, cam; shading = :smooth, shadows = true, shadow_resolution = 2048)
     img = downsample2x(rt.color)
 
     pdf = joinpath(FIGS, "fig_king_scene.pdf")

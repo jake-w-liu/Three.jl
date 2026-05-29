@@ -191,8 +191,9 @@ function soft_render(vertices::Vector{Vec3{Tv}},
             #   max-subtraction cancels in the normalized blend, so this is
             #   mathematically equivalent for moderate γ. (γ is in NDC-depth
             #   units.) Only the faces binned to this pixel's tile are visited.
-            m = T(-Inf)
-            any_face = false
+            m = -one(T) / γ          # background exponent (virtual far-plane surface
+            any_face = false          # z=+1); folding it into the softmax max keeps the
+                                      # background weight stable and <= 1.
             for k in face_lo:face_hi
                 fi = tile_faces[k]
                 tri = screen_tris[fi]
@@ -236,15 +237,18 @@ function soft_render(vertices::Vector{Vec3{Tv}},
                 end
             end
 
-            # Unconditional smooth blend. alpha = 1 - exp(-total_weight) -> 0 as
-            # total_weight -> 0, so the pixel decays to background without a
-            # discrete branch. The normalization is guarded against
-            # divide-by-zero by a smooth eps add (no hard threshold).
-            alpha = one(T) - exp(-total_weight)
-            inv_w = one(T) / (total_weight + eps)
-            image[py, px, 1] = alpha * color_r * inv_w + (one(T) - alpha) * bg.r
-            image[py, px, 2] = alpha * color_g * inv_w + (one(T) - alpha) * bg.g
-            image[py, px, 3] = alpha * color_b * inv_w + (one(T) - alpha) * bg.b
+            # SoftRas partition-of-unity blend: the foreground face weights and a
+            # background weight (a virtual surface at the far plane z=+1, hence
+            # exponent -1/γ, stabilized by the same max m) form a softmax over
+            # {faces, background}. A covered pixel approaches the nearest face
+            # colour as σ,γ -> 0 (recovering the hard rasterizer); an uncovered
+            # pixel (total_weight -> 0) reduces exactly to the background. The eps
+            # floor keeps the denominator strictly positive without a discrete branch.
+            w_bg = exp(-one(T) / γ - m) + eps
+            denom = total_weight + w_bg
+            image[py, px, 1] = (color_r + w_bg * bg.r) / denom
+            image[py, px, 2] = (color_g + w_bg * bg.g) / denom
+            image[py, px, 3] = (color_b + w_bg * bg.b) / denom
         end
     end
 
@@ -306,13 +310,18 @@ function point_segment_distance(px, py, ax, ay, bx, by)
     dx = bx - ax
     dy = by - ay
     len_sq = dx^2 + dy^2
+    # Smoothing epsilon under the square roots: sqrt has an infinite derivative
+    # at 0, so a sample point landing exactly on the segment (distance 0) would
+    # make ForwardDiff return Inf*0 = NaN and poison the whole gradient. The added
+    # 1e-12 (≈1e-6 px) makes the distance smooth everywhere with a finite (zero)
+    # derivative at 0; the bias is negligible relative to the sigmoid softness sigma.
     if len_sq < 1e-20
-        return sqrt((px - ax)^2 + (py - ay)^2)
+        return sqrt((px - ax)^2 + (py - ay)^2 + 1e-12)
     end
     t = clamp(((px - ax)*dx + (py - ay)*dy) / len_sq, zero(px), one(px))
     proj_x = ax + t * dx
     proj_y = ay + t * dy
-    sqrt((px - proj_x)^2 + (py - proj_y)^2)
+    sqrt((px - proj_x)^2 + (py - proj_y)^2 + 1e-12)
 end
 
 # ========================== High-level differentiable render ==========================

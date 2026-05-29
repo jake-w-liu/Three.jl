@@ -556,11 +556,13 @@ function _gltf_decompose(M::Mat4)
     c2 = Vec3(mat4_get(M,1,2), mat4_get(M,2,2), mat4_get(M,3,2))
     c3 = Vec3(mat4_get(M,1,3), mat4_get(M,2,3), mat4_get(M,3,3))
     sx = norm(c1); sy = norm(c2); sz = norm(c3)
-    # Negative determinant means a reflected basis; three.js folds the sign into sx.
+    # Negative determinant means a reflected basis; three.js folds the sign into sx
+    # only (NOT the column): dividing the original column by the now-negative sx
+    # below yields a proper rotation whose recomposition T*R*S reproduces M. Also
+    # negating c1 here would cancel that and silently drop the reflection.
     det = dot(c1, cross(c2, c3))
     if det < 0
         sx = -sx
-        c1 = -c1
     end
     # Pure-rotation columns (guard against zero scale).
     isx = sx == 0 ? zero(sx) : one(sx)/sx

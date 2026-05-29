@@ -2718,4 +2718,57 @@ using ForwardDiff
 
     end
 
+    # Regression tests for the deep-debug correctness fixes (2026-05-29). Each
+    # assertion fails under the original bug, so they lock the fixes in place.
+    @testset "Deep-debug regression fixes" begin
+        FD = Three.ForwardDiff
+        # CRITICAL: soft-rasterizer distance gradients are finite on an edge
+        # (sqrt(0) previously yielded an Inf derivative -> NaN gradient).
+        g1 = FD.gradient(p -> point_segment_distance(p[1],p[2], 0.0,0.0, 2.0,0.0), [1.0,0.0])
+        @test all(isfinite, g1)
+        g2 = FD.gradient(p -> signed_distance_to_triangle(p[1],p[2], 0.0,0.0, 2.0,0.0, 0.0,2.0), [0.6,0.6])
+        @test all(isfinite, g2)
+        function _qsum(p)
+            T = eltype(p)
+            v = [Vec3(T(-0.6),T(-0.6),T(0)), Vec3(T(0.6),T(-0.6),T(0)), Vec3(T(0.6),T(0.6),T(0)), Vec3(T(-0.6),T(0.6),T(0))]
+            f = [(1,2,3),(1,3,4)]; c = [Color3(p[1],T(0.3),T(0.2)), Color3(p[1],T(0.3),T(0.2))]
+            vp = Mat4{T}(ntuple(k -> (k in (1,6,11,16)) ? one(T) : zero(T), 16))
+            sum(soft_render(v, f, c, vp, 24, 24, SoftRasterizerConfig(sigma=T(1.0), gamma=T(1.0), bg_color=Color3(zero(T),zero(T),zero(T)))))
+        end
+        gq = FD.gradient(_qsum, [0.7]); fdq = numerical_gradient(_qsum, [0.7]; δ=1e-5)
+        @test all(isfinite, gq)
+        @test abs(gq[1] - fdq[1]) <= 1e-3 * max(abs(fdq[1]), 1e-6)
+
+        # SoftRas aggregation converges to the hard render as gamma->0:
+        # a covered pixel reaches the face colour, an uncovered pixel is background.
+        vtri = [Vec3(-0.9,-0.9,0.0), Vec3(0.9,-0.9,0.0), Vec3(0.0,0.9,0.0)]
+        vpI = Mat4{Float64}(ntuple(k -> (k in (1,6,11,16)) ? 1.0 : 0.0, 16))
+        imgs = soft_render(vtri, [(1,2,3)], [Color3(0.8,0.5,0.2)], vpI, 32, 32,
+                           SoftRasterizerConfig(sigma=0.3, gamma=0.01, bg_color=Color3(0.0,0.0,0.0)))
+        @test isapprox(imgs[16,16,1], 0.8; atol=0.02)
+        @test imgs[1,1,1] < 0.02
+
+        # look_at / view matrix is finite when eye == target.
+        @test all(isfinite, view_matrix_from_params(1.0,1.0,1.0, 1.0,1.0,1.0, 0.0,1.0,0.0).e)
+
+        # normal matrix == transpose(inverse).
+        Mn = mat4_scaling(2.0,1.0,1.0)
+        @test maximum(abs.(collect(Three.mat4_normal_matrix(Mn).e) .- collect(mat4_transpose(mat4_inverse(Mn)).e))) < 1e-12
+
+        # quat_normalize(zero) -> identity, no NaN.
+        qz = quat_normalize(Quaternion(0.0,0.0,0.0,0.0))
+        @test all(isfinite, (qz.x,qz.y,qz.z,qz.w)) && isapprox(qz.w, 1.0)
+
+        # glTF node decomposition preserves reflections (negative determinant).
+        pr, er, sr = Three._gltf_decompose(mat4_scaling(-1.0,1.0,1.0))
+        Rr = quat_to_mat4(quat_from_euler(er.x, er.y, er.z; order=er.order))
+        prp = mat4_transform_point(mat4_translation(pr.x,pr.y,pr.z) * Rr * mat4_scaling(sr.x,sr.y,sr.z), Vec3(1.0,0.0,0.0))
+        @test isapprox(prp.x, -1.0; atol=1e-6) && abs(prp.y) < 1e-6 && abs(prp.z) < 1e-6
+
+        # silhouette IoU calibration: disjoint -> ~1 loss, identical -> ~0.
+        A = zeros(8,8,3); A[1:4,1:4,:] .= 1.0; B = zeros(8,8,3); B[5:8,5:8,:] .= 1.0
+        @test loss_silhouette_iou(A,B) > 0.9
+        @test loss_silhouette_iou(A,A) < 0.05
+    end
+
 end

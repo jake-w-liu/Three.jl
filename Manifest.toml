@@ -490,7 +490,7 @@ version = "0.8.23"
 
 [[deps.PlotlySupply]]
 deps = ["Base64", "BatchAssign", "ElectronCall", "Infiltrator", "MeshGrid", "PlotlyBase", "Printf", "Reexport"]
-path = "/Users/jake/EMPIRE/projects/ongoing/2026_151/Three.jl/examples/../../PlotlySupply.jl"
+path = "C:\\Users\\User\\EMPIRE\\projects\\ongoing\\2026_151\\Three.jl\\examples\\..\\..\\PlotlySupply.jl"
 uuid = "a389b534-8bca-4fe3-8ff2-14829cd8824f"
 version = "1.7.2"
 

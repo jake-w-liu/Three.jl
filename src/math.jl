@@ -185,7 +185,10 @@ function mat4_rotation_z(θ)
 end
 
 function mat4_look_at(eye::Vec3, target::Vec3, up::Vec3)
-    z = normalize(eye - target)
+    d = eye - target
+    # Guard the degenerate eye==target case before normalising (three.js lookAt):
+    # normalize(0) is NaN and would poison the whole view matrix and its AD gradients.
+    z = dot(d, d) < 1e-12 ? Vec3(zero(d.x), zero(d.y), one(d.z)) : normalize(d)
     xc = cross(up, z)
     if dot(xc, xc) < 1e-12          # up parallel to view dir: perturb z (three.js lookAt)
         if abs(z.z) > one(z.z) - 1e-4
@@ -277,11 +280,10 @@ function mat4_transpose(m::Mat4)
           e[4], e[8], e[12], e[16]))
 end
 
-# Normal matrix: transpose of inverse of upper-left 3x3
+# Normal matrix: transpose of the inverse, so transforming a normal as a
+# direction by this matrix keeps it perpendicular under non-uniform scale.
 function mat4_normal_matrix(m::Mat4)
-    inv_m = mat4_inverse(m)
-    # Return just the 3x3 transpose-inverse as a function on Vec3
-    return inv_m  # caller uses mat4_transform_direction on the transpose
+    return mat4_transpose(mat4_inverse(m))
 end
 
 # ========================== Mat3 ==========================
@@ -366,6 +368,9 @@ end
 
 function quat_normalize(q::Quaternion)
     l = sqrt(q.x^2 + q.y^2 + q.z^2 + q.w^2)
+    if l < 1e-20    # zero quaternion: return identity (three.js Quaternion.normalize)
+        return Quaternion(zero(q.x), zero(q.y), zero(q.z), one(q.w))
+    end
     Quaternion(q.x/l, q.y/l, q.z/l, q.w/l)
 end
 

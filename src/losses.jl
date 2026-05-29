@@ -106,7 +106,7 @@ Compares binary silhouettes extracted from images.
 `threshold` separates foreground from background.
 """
 function loss_silhouette_iou(image::Array{T, 3}, target::Array{S, 3};
-                              threshold=0.01) where {T, S}
+                              threshold=0.05) where {T, S}
     R = promote_type(T, S)
     H, W, _ = size(image)
 
@@ -120,9 +120,12 @@ function loss_silhouette_iou(image::Array{T, 3}, target::Array{S, 3};
             img_val = max(image[i, j, 1], image[i, j, 2], image[i, j, 3])
             tgt_val = max(target[i, j, 1], target[i, j, 2], target[i, j, 3])
 
-            # Soft occupancy
-            img_occ = sigmoid_approx((img_val - threshold) * 50)
-            tgt_occ = sigmoid_approx((tgt_val - threshold) * 50)
+            # Soft occupancy. The slope must be steep enough that a true-black
+            # background (brightness 0) reads ~0 occupancy: at slope 200 and
+            # threshold 0.05, background -> sigmoid(-10) ~ 5e-5, while any lit
+            # object pixel (>~0.08) -> ~1, so disjoint silhouettes give IoU ~ 0.
+            img_occ = sigmoid_approx((img_val - threshold) * 200)
+            tgt_occ = sigmoid_approx((tgt_val - threshold) * 200)
 
             intersection += img_occ * tgt_occ
             union_val += img_occ + tgt_occ - img_occ * tgt_occ
