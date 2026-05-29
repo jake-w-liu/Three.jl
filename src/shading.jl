@@ -3,6 +3,16 @@
 # Pure Julia, AD-compatible — no branching on types in hot path.
 # --------------------------------------------------------------------------
 
+# Blinn-Phong half-vector, guarded against the antiparallel case light_dir = -view_dir
+# where light_dir + view_dir is the zero vector and normalize would divide by zero
+# (producing NaN). In that degenerate configuration every lobe that uses the half
+# vector is gated to zero by N·L or N·H, so any finite unit vector is a safe fallback.
+@inline function _half_vec(light_dir::Vec3, view_dir::Vec3)
+    s = light_dir + view_dir
+    n = norm(s)
+    n > 1e-12 ? s / n : view_dir
+end
+
 """
 Compute Lambertian diffuse contribution for one light.
 Returns Color3 — the diffuse color modulated by light.
@@ -25,10 +35,12 @@ function shade_phong(normal::Vec3, light_dir::Vec3, view_dir::Vec3,
     ndotl = max(dot(normal, light_dir), zero(light_intensity))
     diffuse = diffuse_color * light_color * (ndotl * light_intensity)
 
-    # Specular (Blinn-Phong half-vector)
-    half_vec = normalize(light_dir + view_dir)
+    # Specular (Blinn-Phong half-vector). Mask the lobe by N·L so a light behind
+    # the surface (N·L≤0, but N·H can still be >0) produces no specular leak.
+    half_vec = _half_vec(light_dir, view_dir)
     ndoth = max(dot(normal, half_vec), zero(shininess))
-    spec = specular_color * light_color * (ndoth^shininess * light_intensity)
+    spec_mask = ndotl > zero(ndotl) ? one(light_intensity) : zero(light_intensity)
+    spec = specular_color * light_color * (ndoth^shininess * light_intensity * spec_mask)
 
     diffuse + spec
 end
@@ -45,7 +57,7 @@ function shade_pbr(normal::Vec3, light_dir::Vec3, view_dir::Vec3,
     ndotl = max(dot(normal, light_dir), zero(α))
     ndotv = max(dot(normal, view_dir), zero(α))
 
-    h = normalize(light_dir + view_dir)
+    h = _half_vec(light_dir, view_dir)
     ndoth = max(dot(normal, h), zero(α))
     vdoth = max(dot(view_dir, h), zero(α))
 
@@ -140,6 +152,22 @@ end
 
 @inline _vertex_uv(geo::BufferGeometry, i) = (geo.uvs[(i-1)*2+1], geo.uvs[(i-1)*2+2])
 
+# Material opt-in for per-vertex color modulation (three.js `vertexColors`).
+@inline _wants_vertex_colors(m) = hasfield(typeof(m), :vertex_colors) && getfield(m, :vertex_colors)
+
+# Per-face average of the three vertices' RGB colors from the geometry's :color
+# attribute (item_size 3, flat [r,g,b,...]). three.js multiplies the interpolated
+# vertex color into the material color; for flat per-face shading we use the
+# face's vertex-color centroid.
+@inline function _face_vertex_color(attr::BufferAttribute, i1, i2, i3)
+    s = attr.item_size
+    b1 = (i1-1)*s; b2 = (i2-1)*s; b3 = (i3-1)*s
+    d = attr.data
+    Color3((d[b1+1] + d[b2+1] + d[b3+1]) / 3,
+           (d[b1+2] + d[b2+2] + d[b3+2]) / 3,
+           (d[b1+3] + d[b2+3] + d[b3+3]) / 3)
+end
+
 # Perturb a face normal by a tangent-space normal map. The tangent frame is
 # derived from the triangle's world positions and UV gradients (standard
 # tangent-from-UV), then the sampled normal `2·texel-1` is rotated into world.
@@ -169,14 +197,18 @@ function _apply_roughness_map(m::MeshStandardMaterial, rmap, u, v)
     MeshStandardMaterial(color=m.color, emissive=m.emissive, metalness=m.metalness,
                          roughness=rg, opacity=m.opacity, transparent=m.transparent,
                          side=m.side, map=m.map, normal_map=m.normal_map,
-                         roughness_map=m.roughness_map, ao_map=m.ao_map, emissive_map=m.emissive_map)
+                         roughness_map=m.roughness_map, ao_map=m.ao_map, emissive_map=m.emissive_map,
+                         vertex_colors=m.vertex_colors, envmap=m.envmap, light_map=m.light_map)
 end
 function _apply_roughness_map(m::MeshPhysicalMaterial, rmap, u, v)
     rg = sample_texture(rmap, u, v).g
     MeshPhysicalMaterial(color=m.color, emissive=m.emissive, metalness=m.metalness,
                          roughness=rg, clearcoat=m.clearcoat, clearcoat_roughness=m.clearcoat_roughness,
                          transmission=m.transmission, ior=m.ior, opacity=m.opacity,
-                         transparent=m.transparent, side=m.side)
+                         transparent=m.transparent, side=m.side, envmap=m.envmap,
+                         sheen=m.sheen, sheen_color=m.sheen_color, sheen_roughness=m.sheen_roughness,
+                         iridescence=m.iridescence, iridescence_ior=m.iridescence_ior,
+                         iridescence_thickness=m.iridescence_thickness, light_map=m.light_map)
 end
 _apply_roughness_map(m::AbstractMaterial, rmap, u, v) = m   # other materials: ignore
 
@@ -202,8 +234,20 @@ function shade_mesh_faces!(colors::Vector{Color3{Float64}},
     emissive_map = _material_field(material, :emissive_map)
     normal_map = _material_field(material, :normal_map)
     roughness_map = _material_field(material, :roughness_map)
+    light_map = _material_field(material, :light_map)
     use_maps = has_uvs && (albedo_map !== nothing || ao_map !== nothing || emissive_map !== nothing ||
-                           normal_map !== nothing || roughness_map !== nothing)
+                           normal_map !== nothing || roughness_map !== nothing ||
+                           light_map !== nothing)
+
+    # Per-vertex color modulation: material opt-in AND a geometry :color attribute
+    # with at least RGB components. Resolved once so the hot loop stays type-stable.
+    color_attr = (_wants_vertex_colors(material) && has_attribute(geo, :color)) ?
+                 get_attribute(geo, :color) : nothing
+    use_vertex_colors = color_attr !== nothing && color_attr.item_size >= 3 &&
+                        length(color_attr.data) >= geo.n_vertices * color_attr.item_size
+
+    # Environment-map reflection (basic IBL specular) for PBR materials.
+    env_map = _envmap_field(material)
 
     for fi in 1:n_faces
         i1, i2, i3 = get_face(geo, fi)
@@ -243,7 +287,27 @@ function shade_mesh_faces!(colors::Vector{Color3{Float64}},
             if ao_map !== nothing
                 ao = sample_texture(ao_map, u, v); color = Color3(color.r*ao.r, color.g*ao.g, color.b*ao.b)
             end
+            # lightMap: baked indirect lighting, multiplied into the lit result
+            # (like aoMap) so pre-baked GI tints the surface (three.js lightMap).
+            if light_map !== nothing
+                lm = sample_texture(light_map, u, v)
+                color = Color3(color.r*lm.r, color.g*lm.g, color.b*lm.b)
+            end
             emissive_map !== nothing && (color = color + sample_texture(emissive_map, u, v))
+        end
+
+        # Per-vertex color: multiply the face's average vertex RGB into the result
+        # (three.js multiplies vertex color into the material color, like albedo).
+        if use_vertex_colors
+            color = color * _face_vertex_color(color_attr, i1, i2, i3)
+        end
+
+        # Environment reflection (basic IBL specular) added on top of the lit/
+        # textured result. Metals reflect albedo-tinted env; dielectrics a small
+        # Fresnel reflection. Uses `eff_mat` so a roughness-map override applies.
+        if env_map !== nothing
+            color = color + _envmap_reflection(env_map, face_n, view_dir,
+                                               eff_mat.color, eff_mat.metalness, eff_mat.roughness)
         end
 
         colors[fi] = clamp_color(color)
@@ -296,14 +360,145 @@ function _pbr_ambient(normal::Vec3, albedo::Color3, metalness, roughness, fill::
            (albedo.b * kd + F0b * spec_scale) * fill.b)
 end
 
+# Environment-map (basic IBL) specular reflection. Reflect the view direction
+# about the shading normal, sample the cube map along that mirror direction, and
+# weight by a Schlick-Fresnel F0 (≈albedo for metals, ≈0.04 for dielectrics).
+# Roughness attenuates the contribution: rough surfaces reflect little sharp
+# environment radiance (matching the `_pbr_ambient` `1 - 0.7·roughness` lobe).
+# `view_dir` points from the surface toward the camera, so the incident ray is
+# `-view_dir`; its reflection about `normal` is `2(N·V)N - V`.
+function _envmap_reflection(env::CubeTexture, normal::Vec3, view_dir::Vec3,
+                            albedo::Color3, metalness, roughness)
+    ndotv = dot(normal, view_dir)
+    refl = normal * (2 * ndotv) - view_dir            # mirror reflection direction
+    env_c = sample_cube(env, refl)
+    # Grazing-angle Fresnel boost from the view/normal angle (vdotn analog).
+    fres = (one(ndotv) - max(ndotv, zero(ndotv)))^5
+    F0r = lerp_scalar(0.04, albedo.r, metalness)
+    F0g = lerp_scalar(0.04, albedo.g, metalness)
+    F0b = lerp_scalar(0.04, albedo.b, metalness)
+    Fr = F0r + (one(F0r) - F0r) * fres
+    Fg = F0g + (one(F0g) - F0g) * fres
+    Fb = F0b + (one(F0b) - F0b) * fres
+    spec_scale = one(roughness) - roughness * 0.7     # sharp reflection fades with roughness
+    Color3(env_c.r * Fr * spec_scale,
+           env_c.g * Fg * spec_scale,
+           env_c.b * Fb * spec_scale)
+end
+
+# Dispatch helper: only MeshStandardMaterial / MeshPhysicalMaterial carry envmap.
+@inline _envmap_field(m) = hasfield(typeof(m), :envmap) ? getfield(m, :envmap) : nothing
+
 # Dielectric clearcoat highlight: Schlick-Fresnel-weighted Blinn-Phong lobe (F0 = 0.04).
 @inline function _clearcoat_spec(normal::Vec3, light_dir::Vec3, view_dir::Vec3, cc_roughness)
-    h = normalize(light_dir + view_dir)
+    h = _half_vec(light_dir, view_dir)
     ndoth = max(dot(normal, h), zero(cc_roughness))
     vdoth = max(dot(view_dir, h), zero(cc_roughness))
     shininess = 2 / max((cc_roughness*cc_roughness)^2, 1e-4) + 2   # roughness → exponent
     fresnel = 0.04 + 0.96 * (1 - vdoth)^5
     return fresnel * ndoth^shininess
+end
+
+# Charlie/Ashikhmin sheen distribution (the inverted-Gaussian "fabric" lobe used
+# by three.js' sheen model). `c = N·H`, `r = sheen_roughness`. With a = max(r²,ε)
+# this peaks at grazing half-angles (retroreflective rim glow on cloth/velvet).
+@inline function _d_charlie(c, r)
+    a = max(r * r, 1e-3)
+    inv_a = one(a) / a
+    s = sin(acos(clamp(c, -one(c), one(c))))         # sinθ_h, finite at c=±1
+    return (2 + inv_a) * s^inv_a / (2 * π)
+end
+
+# Sheen lobe contribution for one light: f = sheen·sheen_color·D_charlie(N·H,r)·(N·L).
+# Returned as a Color3 (before the light colour/intensity scaling applied by the caller).
+@inline function _sheen_lobe(m::MeshPhysicalMaterial, normal::Vec3, light_dir::Vec3, view_dir::Vec3)
+    ndotl = max(dot(normal, light_dir), 0.0)
+    ndotl <= 0.0 && return Color3(0.0, 0.0, 0.0)
+    h = _half_vec(light_dir, view_dir)
+    ndoth = max(dot(normal, h), 0.0)
+    d = _d_charlie(ndoth, m.sheen_roughness)
+    return m.sheen_color * (m.sheen * d * ndotl)
+end
+
+# Iridescence tint of the dielectric Fresnel F0. A thin film of index
+# `iridescence_ior` and thickness `thickness` (nm) produces an optical path
+# difference Δ = 2·n·d·cosθ_t (θ_t the refraction angle inside the film). The
+# per-wavelength reflectance modulation is taken as a cosine interference term
+# I(λ) = 0.5·(1 + cos(2π·Δ/λ)) evaluated at red/green/blue reference wavelengths
+# (650/550/450 nm), giving an RGB hue that shifts with viewing angle. We blend
+# the base F0 toward this hue by `iridescence`. This is a compact 3-wavelength
+# approximation of three.js' full Airy/thin-film model, kept finite at θ=0 and
+# grazing by clamping cosθ.
+@inline function _iridescent_f0(base_f0::Color3, ndotv, film_ior, thickness, blend)
+    cti = clamp(ndotv, 0.0, 1.0)                      # cosθ_i (view vs normal)
+    # Snell refraction into the film (n_outside ≈ 1). sinθ_t = sinθ_i / n_film.
+    sti = sqrt(max(1.0 - cti * cti, 0.0)) / max(film_ior, 1e-3)
+    ctt = sqrt(max(1.0 - sti * sti, 0.0))             # cosθ_t, finite at all angles
+    opd = 2.0 * film_ior * thickness * ctt            # optical path difference (nm)
+    ir = 0.5 * (1 + cos(2π * opd / 650.0))
+    ig = 0.5 * (1 + cos(2π * opd / 550.0))
+    ib = 0.5 * (1 + cos(2π * opd / 450.0))
+    tint = Color3(ir, ig, ib)
+    b = clamp(blend, 0.0, 1.0)
+    return Color3(base_f0.r * (1 - b) + tint.r * b,
+                  base_f0.g * (1 - b) + tint.g * b,
+                  base_f0.b * (1 - b) + tint.b * b)
+end
+
+# Iridescent specular boost added on top of the base PBR specular. We recompute a
+# Schlick specular highlight whose Fresnel uses the thin-film-tinted F0 and blend
+# in only the *difference* from the untinted dielectric F0 (≈0.04), so a material
+# with iridescence=0 is byte-identical to before and metals/albedo are untouched.
+@inline function _iridescence_spec(m::MeshPhysicalMaterial, normal::Vec3,
+                                   light_dir::Vec3, view_dir::Vec3)
+    ndotl = max(dot(normal, light_dir), 0.0)
+    ndotv = max(dot(normal, view_dir), 0.0)
+    (ndotl <= 0.0) && return Color3(0.0, 0.0, 0.0)
+    h = _half_vec(light_dir, view_dir)
+    ndoth = max(dot(normal, h), 0.0)
+    vdoth = max(dot(view_dir, h), 0.0)
+    base_f0 = Color3(0.04, 0.04, 0.04)
+    tinted = _iridescent_f0(base_f0, ndotv, m.iridescence_ior, m.iridescence_thickness, m.iridescence)
+    # Schlick Fresnel of the tinted vs base F0, masked by a Blinn-Phong lobe so
+    # the tint shows up in the highlight rather than as a flat colour shift.
+    fres = (1 - vdoth)^5
+    Ft = Color3(tinted.r + (1 - tinted.r) * fres,
+                tinted.g + (1 - tinted.g) * fres,
+                tinted.b + (1 - tinted.b) * fres)
+    Fb = Color3(base_f0.r + (1 - base_f0.r) * fres,
+                base_f0.g + (1 - base_f0.g) * fres,
+                base_f0.b + (1 - base_f0.b) * fres)
+    α = m.roughness * m.roughness
+    α2 = α * α
+    denom_d = ndoth * ndoth * (α2 - 1) + 1
+    D = α2 / (π * denom_d * denom_d + 1e-7)
+    lobe = D / (4 * ndotv * ndotl + 1e-7) * ndotl
+    Color3((Ft.r - Fb.r) * lobe, (Ft.g - Fb.g) * lobe, (Ft.b - Fb.b) * lobe)
+end
+
+# APPROXIMATE transmission/refraction fill. A CPU rasterizer cannot ray-trace
+# true refraction (no screen-space colour buffer to refract through and no scene
+# ray queries), so genuine `transmission` is not physically reproducible here.
+# This is a Fresnel-tint approximation: at near-grazing angles the surface
+# reflects (low transmittance) and near normal incidence it transmits, revealing
+# a tinted background. The transmitted radiance is attenuated by the material
+# colour (a single-sample Beer-Lambert-style tint, treating `color` as the per-
+# unit transmittance) and weighted by transmission·(1-Fresnel). `background` is
+# the ambient/environment fill colour the ray would see behind the surface.
+@inline function _transmission_fill(m::MeshPhysicalMaterial, normal::Vec3, view_dir::Vec3,
+                                    background::Color3)
+    m.transmission <= 0.0 && return Color3(0.0, 0.0, 0.0)
+    ndotv = clamp(dot(normal, view_dir), 0.0, 1.0)
+    # Schlick reflectance from the IOR-derived F0; transmittance = 1 - reflectance.
+    r0 = ((m.ior - 1) / (m.ior + 1))^2
+    refl = r0 + (1 - r0) * (1 - ndotv)^5
+    transmit = (1 - refl) * m.transmission
+    # Beer-Lambert tint: longer optical path near grazing darkens/colours more.
+    path = 1.0 / max(ndotv, 1e-3)
+    att = Color3(m.color.r^path, m.color.g^path, m.color.b^path)
+    Color3(background.r * att.r * transmit,
+           background.g * att.g * transmit,
+           background.b * att.b * transmit)
 end
 
 # Lit materials share one accumulation loop so direct lighting can be modulated
@@ -316,7 +511,9 @@ _fill_response(m::MeshLambertMaterial,  n, fc) = m.color * fc
 _fill_response(m::MeshPhongMaterial,    n, fc) = m.color * fc
 _fill_response(m::MeshToonMaterial,     n, fc) = m.color * fc
 _fill_response(m::MeshStandardMaterial, n, fc) = _pbr_ambient(n, m.color, m.metalness, m.roughness, fc)
-_fill_response(m::MeshPhysicalMaterial, n, fc) = _pbr_ambient(n, m.color, m.metalness, m.roughness, fc)
+function _fill_response(m::MeshPhysicalMaterial, n, fc)
+    _pbr_ambient(n, m.color, m.metalness, m.roughness, fc)
+end
 
 _direct_response(m::MeshLambertMaterial, n, v, lc, li, ldir) =
     shade_lambert(n, ldir, lc, li, m.color)
@@ -327,7 +524,16 @@ _direct_response(m::MeshStandardMaterial, n, v, lc, li, ldir) =
 function _direct_response(m::MeshPhysicalMaterial, n, v, lc, li, ldir)
     base = shade_pbr(n, ldir, v, lc, li, m.color, m.metalness, m.roughness)
     cc = m.clearcoat * _clearcoat_spec(n, ldir, v, m.clearcoat_roughness) * max(dot(n, ldir), 0.0)
-    base + lc * (cc * li)
+    result = base + lc * (cc * li)
+    # Retroreflective sheen lobe (Charlie distribution), scaled by the light.
+    if m.sheen > 0.0
+        result = result + _sheen_lobe(m, n, ldir, v) * lc * li
+    end
+    # Thin-film iridescence shifts the dielectric specular hue with view angle.
+    if m.iridescence > 0.0
+        result = result + _iridescence_spec(m, n, ldir, v) * lc * li
+    end
+    return result
 end
 function _direct_response(m::MeshToonMaterial, n, v, lc, li, ldir)
     ndotl = max(dot(n, ldir), 0.0)
@@ -335,17 +541,39 @@ function _direct_response(m::MeshToonMaterial, n, v, lc, li, ldir)
     m.color * lc * (banded * li)
 end
 
+# Per-light accumulation, factored into a function barrier so that once a light
+# is dispatched to its concrete type the inner work (light_contribution, fill
+# response, direct response) is type-stable instead of boxing through the
+# abstract `Vector{AbstractLight}` element type. The arithmetic and accumulation
+# order are byte-identical to the inlined loop: `light_contribution` is queried
+# only for non-fill lights, and a non-positive visibility leaves `result`
+# unchanged (the previous loop `continue` skipped the addition).
+# Transmission contribution is gated to MeshPhysicalMaterial and treats the
+# fill irradiance as the background radiance the refracted ray would reveal. A
+# CPU rasterizer cannot ray-trace true refraction, so this is the documented
+# Fresnel-tint approximation in `_transmission_fill` (no screen-space refraction).
+@inline _transmission_response(m, n::Vec3, v::Vec3, fc::Color3) = Color3(0.0, 0.0, 0.0)
+@inline _transmission_response(m::MeshPhysicalMaterial, n::Vec3, v::Vec3, fc::Color3) =
+    m.transmission > 0.0 ? _transmission_fill(m, n, v, fc) : Color3(0.0, 0.0, 0.0)
+
+function _accumulate_light(result, m, normal::Vec3, view_dir::Vec3,
+                           position::Vec3, light, shadow_fn)
+    if _is_fill_light(light)
+        fc = _fill_color(normal, light)
+        return result + _fill_response(m, normal, fc) +
+               _transmission_response(m, normal, view_dir, fc)
+    else
+        lc, li, ldir = light_contribution(light, position)
+        vis = shadow_fn === nothing ? 1.0 : shadow_fn(light, position)
+        vis <= 0.0 && return result
+        return result + _direct_response(m, normal, view_dir, lc, li, ldir) * vis
+    end
+end
+
 function _shade_lit(m, normal::Vec3, view_dir::Vec3, position::Vec3, lights, shadow_fn)
     result = m.emissive
     for light in lights
-        if _is_fill_light(light)
-            result = result + _fill_response(m, normal, _fill_color(normal, light))
-        else
-            lc, li, ldir = light_contribution(light, position)
-            vis = shadow_fn === nothing ? 1.0 : shadow_fn(light, position)
-            vis <= 0.0 && continue
-            result = result + _direct_response(m, normal, view_dir, lc, li, ldir) * vis
-        end
+        result = _accumulate_light(result, m, normal, view_dir, position, light, shadow_fn)
     end
     return result
 end
@@ -426,7 +654,20 @@ function light_contribution(light::SpotLight, position::Vec3)
 
     spot_effect = clamp((cos_angle - cos_outer) / max(cos_inner - cos_outer, 1e-10), 0.0, 1.0)
 
-    attenuation = spot_effect / max(dist^light.decay, 1e-10)
+    # Range cutoff (mirrors PointLight): a finite `distance` applies a smooth
+    # window that vanishes at the range limit; `distance <= 0` means unbounded.
+    dwin = light.distance > 0 ? max(1.0 - (dist / light.distance)^2, 0.0) : 1.0
+    attenuation = spot_effect * dwin / max(dist^light.decay, 1e-10)
+
+    # IES photometric distribution: when a measured profile is attached, modulate
+    # the intensity by the profile's normalized candela at the vertical angle θ
+    # between the light's aim axis and the light→surface direction (0° = beam
+    # axis). `cos_angle` above is exactly that cosine, so θ = acos(cos_angle).
+    if light.ies_profile !== nothing
+        θ = acosd(clamp(cos_angle, -1.0, 1.0))
+        attenuation *= ies_intensity(light.ies_profile, θ)
+    end
+
     (light.color, light.intensity * attenuation, dir)
 end
 

@@ -4,6 +4,145 @@
 
 abstract type AbstractLight <: AbstractObject3D end
 
+# ========================== IESProfile ==========================
+# Photometric profile for real-world luminaires (IESNA LM-63). A measured
+# luminaire is described by its luminous intensity (candela) as a function of the
+# vertical angle θ (degrees from the downward/aim axis: 0° = straight down the
+# beam axis, 90° = perpendicular, up to 180°). Azimuthal (horizontal) variation
+# is collapsed: this single-plane representation uses one candela value per
+# vertical angle (the common rotationally symmetric case for spotlights). The
+# stored angles are assumed sorted ascending; lookups linearly interpolate and
+# clamp outside the tabulated range.
+
+struct IESProfile
+    angles::Vector{Float64}    # vertical angles in degrees, ascending
+    candela::Vector{Float64}   # luminous intensity (cd) at each angle
+    max_candela::Float64       # peak candela, for normalization to [0,1]
+end
+
+"""
+    IESProfile(angles, candela)
+
+Build a photometric profile from vertical `angles` (degrees) and matching
+`candela` values. The peak candela is recorded so lookups can return a
+normalized [0,1] multiplier.
+"""
+function IESProfile(angles::AbstractVector{<:Real}, candela::AbstractVector{<:Real})
+    length(angles) == length(candela) ||
+        throw(ArgumentError("IESProfile: angles and candela must have equal length"))
+    length(angles) >= 1 || throw(ArgumentError("IESProfile: need at least one sample"))
+    a = collect(Float64, angles)
+    c = collect(Float64, candela)
+    mx = maximum(c)
+    IESProfile(a, c, mx)
+end
+
+"""
+    ies_candela(profile, angle_deg) -> Float64
+
+Linearly interpolate the candela value at a vertical angle (degrees), clamping
+to the tabulated endpoints outside `[angles[1], angles[end]]`.
+"""
+function ies_candela(profile::IESProfile, angle_deg::Real)
+    a = profile.angles
+    c = profile.candela
+    n = length(a)
+    n == 1 && return c[1]
+    θ = Float64(angle_deg)
+    θ <= a[1] && return c[1]
+    θ >= a[n] && return c[n]
+    # locate the bracketing interval (angles are ascending)
+    @inbounds for i in 2:n
+        if θ <= a[i]
+            t = (θ - a[i-1]) / (a[i] - a[i-1])
+            return c[i-1] + (c[i] - c[i-1]) * t
+        end
+    end
+    return c[n]
+end
+
+"""
+    ies_intensity(profile, angle_deg) -> Float64
+
+Normalized luminous-intensity multiplier in `[0,1]` (candela divided by the
+profile peak) at a vertical angle in degrees. Used to modulate a light's
+intensity by its measured photometric distribution.
+"""
+function ies_intensity(profile::IESProfile, angle_deg::Real)
+    profile.max_candela <= 0 && return 0.0
+    return ies_candela(profile, angle_deg) / profile.max_candela
+end
+
+"""
+    parse_ies(text) -> IESProfile
+
+Parse an IESNA LM-63 photometric data file (the `.ies` format emitted by lamp
+manufacturers and supported by three.js' IESLoader). The parser reads the
+`TILT=` line, the two numeric control lines, then the vertical-angle vector and
+the candela values, supporting the common single-horizontal-plane (rotationally
+symmetric) case. Multi-plane files are collapsed to their first horizontal
+plane. Keyword/label lines beginning with `[` are ignored.
+
+The numeric layout after `TILT=NONE` is:
+
+    <num_lamps> <lumens_per_lamp> <candela_multiplier> <num_vertical> <num_horizontal>
+    <ballast_factor> <future_use> <input_watts>
+    <vertical_angles...>      (num_vertical values)
+    <horizontal_angles...>    (num_horizontal values)
+    <candela values...>       (num_vertical × num_horizontal, plane-major)
+"""
+function parse_ies(text::AbstractString)
+    lines = split(text, '\n')
+    # Find the TILT line; everything after it is the numeric payload.
+    tilt_idx = findfirst(l -> occursin("TILT=", uppercase(l)), lines)
+    tilt_idx === nothing && throw(ArgumentError("parse_ies: no TILT= line found"))
+    tilt_line = uppercase(strip(lines[tilt_idx]))
+    payload_start = tilt_idx + 1
+    # TILT=INCLUDE embeds extra tilt tables; TILT=NONE / TILT=<file> do not.
+    if endswith(tilt_line, "INCLUDE") || occursin("TILT=INCLUDE", tilt_line)
+        # Skip the embedded tilt block: 1 line (lamp-to-lumin geometry),
+        # 1 line (num tilt angles), then the angle and multiplier rows.
+        # Robustly skip by consuming the next 4 numeric lines.
+        payload_start = tilt_idx + 5
+    end
+    # Gather all numeric tokens from the payload, ignoring [KEYWORD] label lines.
+    nums = Float64[]
+    for li in payload_start:length(lines)
+        s = strip(lines[li])
+        (isempty(s) || startswith(s, '[')) && continue
+        for tok in split(s)
+            v = tryparse(Float64, tok)
+            v !== nothing && push!(nums, v)
+        end
+    end
+    length(nums) >= 14 || throw(ArgumentError("parse_ies: truncated photometric data"))
+    # The LM-63 control block is 13 numeric values (the standard splits them as a
+    # 10-value first line and a 3-value second line, but token order is fixed
+    # regardless of line wrapping):
+    #   1: num_lamps          2: lumens_per_lamp   3: candela_multiplier
+    #   4: num_vertical_angles 5: num_horizontal_angles
+    #   6: photometric_type   7: units_type        8: width
+    #   9: length            10: height
+    #  11: ballast_factor    12: future_use       13: input_watts
+    # The vertical-angle vector starts at token 14.
+    cand_mult = nums[3]
+    num_vert = Int(round(nums[4]))
+    num_horiz = max(Int(round(nums[5])), 1)
+    (num_vert >= 1) || throw(ArgumentError("parse_ies: invalid vertical-angle count"))
+    idx = 14
+    vend = idx + num_vert - 1
+    vend <= length(nums) || throw(ArgumentError("parse_ies: missing vertical angles"))
+    vangles = nums[idx:vend]
+    idx = vend + 1
+    hend = idx + num_horiz - 1
+    hend <= length(nums) || throw(ArgumentError("parse_ies: missing horizontal angles"))
+    idx = hend + 1                        # skip horizontal angles (single-plane collapse)
+    cend = idx + num_vert - 1             # take the first horizontal plane's candela column
+    cend <= length(nums) || throw(ArgumentError("parse_ies: missing candela values"))
+    cand = nums[idx:cend] .* (cand_mult > 0 ? cand_mult : 1.0)
+    return IESProfile(vangles, cand)
+end
+
 # ========================== AmbientLight ==========================
 
 mutable struct AmbientLight <: AbstractLight
@@ -81,14 +220,15 @@ mutable struct PointLight <: AbstractLight
     distance::Float64
     decay::Float64
     cast_shadow::Bool
+    ies_profile::Any   # optional IESProfile photometric distribution (nothing = isotropic)
 end
 
 function PointLight(; color=Color3(1.0, 1.0, 1.0), intensity=1.0,
                      distance=0.0, decay=2.0, position=Vec3(),
-                     name="PointLight")
+                     name="PointLight", ies_profile=nothing)
     PointLight(position, Euler(), Vec3(1.0,1.0,1.0),
                nothing, AbstractObject3D[], true, name, _next_id(),
-               color, intensity, distance, decay, false)
+               color, intensity, distance, decay, false, ies_profile)
 end
 
 get_position(o::PointLight) = o.position
@@ -118,15 +258,16 @@ mutable struct SpotLight <: AbstractLight
     decay::Float64
     target::Vec3{Float64}
     cast_shadow::Bool
+    ies_profile::Any   # optional IESProfile photometric distribution (nothing = analytic cone)
 end
 
 function SpotLight(; color=Color3(1.0, 1.0, 1.0), intensity=1.0,
                     distance=0.0, angle=π/3, penumbra=0.0, decay=2.0,
-                    position=Vec3(0.0, 1.0, 0.0), name="SpotLight")
+                    position=Vec3(0.0, 1.0, 0.0), name="SpotLight", ies_profile=nothing)
     SpotLight(position, Euler(), Vec3(1.0,1.0,1.0),
               nothing, AbstractObject3D[], true, name, _next_id(),
               color, intensity, distance, angle, penumbra, decay,
-              Vec3(), false)
+              Vec3(), false, ies_profile)
 end
 
 get_position(o::SpotLight) = o.position

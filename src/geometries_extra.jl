@@ -191,19 +191,19 @@ function CapsuleGeometry(; radius=1.0, length=1.0, cap_segments=8, radial_segmen
     for s in 0:radial_segments
         phi = s/radial_segments * 2π
         c = cos(phi); sn = sin(phi)
-        for (r, y) in profile
+        for (j, (r, y)) in enumerate(profile)
             x = r*c; z = -r*sn
             cy = clamp(y, -half, half)               # nearest point on the spine
             nx = x; ny = y - cy; nz = z
             nl = sqrt(nx^2 + ny^2 + nz^2); nl > 0 && (nx/=nl; ny/=nl; nz/=nl)
             push!(positions, x, y, z); push!(normals, nx, ny, nz)
-            push!(uvs, s/radial_segments, 0.0)
+            push!(uvs, s/radial_segments, (j-1)/(np-1))
         end
     end
     for s in 0:radial_segments-1, j in 0:np-2
         a = s*np + j + 1; b = (s+1)*np + j + 1
         c = (s+1)*np + j + 2; d = s*np + j + 2
-        push!(indices, a, b, d, b, c, d)
+        push!(indices, a, d, b, b, d, c)
     end
     BufferGeometry(positions, normals, uvs, indices, (radial_segments+1)*np, Base.length(indices) ÷ 3)
 end

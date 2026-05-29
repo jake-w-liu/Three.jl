@@ -11,10 +11,12 @@ mutable struct Texture
     wrap_t::Symbol                     # :repeat | :clamp | :mirror  (v)
     filter::Symbol                     # :nearest | :bilinear
     mipmaps::Vector{Array{Float64, 3}} # optional pyramid (level 1 = base/2)
+    colorspace::Symbol                 # :srgb | :linear  (three.js Texture.colorSpace)
 end
 
-function Texture(data::Array{Float64,3}; wrap_s=:repeat, wrap_t=:repeat, filter=:bilinear)
-    Texture(data, wrap_s, wrap_t, filter, Array{Float64,3}[])
+function Texture(data::Array{Float64,3}; wrap_s=:repeat, wrap_t=:repeat, filter=:bilinear,
+                 mipmaps::Vector{Array{Float64,3}}=Array{Float64,3}[], colorspace::Symbol=:srgb)
+    Texture(data, wrap_s, wrap_t, filter, mipmaps, colorspace)
 end
 DataTexture(data::Array{Float64,3}; kwargs...) = Texture(data; kwargs...)
 CanvasTexture(data::Array{Float64,3}; kwargs...) = Texture(data; kwargs...)
@@ -41,7 +43,10 @@ end
     y = _wrap_coord(iy, H, tex.wrap_t) + 1
     if C == 1
         g = tex.data[y, x, 1]; return Color3(g, g, g)
+    elseif C == 2
+        g = tex.data[y, x, 1]; return Color3(g, g, g)   # treat channel 1 as luminance
     end
+    # C >= 3: RGB
     Color3(tex.data[y, x, 1], tex.data[y, x, 2], tex.data[y, x, 3])
 end
 
@@ -65,6 +70,24 @@ function sample_texture(tex::Texture, u, v)
     top = c00 * (1 - tx) + c10 * tx
     bot = c01 * (1 - tx) + c11 * tx
     return top * (1 - ty) + bot * ty
+end
+
+"""
+    sample_texture_linear(tex, u, v) -> Color3
+
+Sample the texture and return the color in linear light. When
+`tex.colorspace === :srgb` the filtered RGB sample is converted with the
+standard sRGB→linear transfer function per channel
+(`c ≤ 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4`), matching three.js's
+`SRGBColorSpace` decode for color textures. When `tex.colorspace === :linear`
+the raw sample is returned unchanged (for data textures such as normal,
+roughness, metalness, AO, or depth maps). `sample_texture` itself is left
+untouched and always returns the raw stored values.
+"""
+function sample_texture_linear(tex::Texture, u, v)
+    c = sample_texture(tex, u, v)
+    tex.colorspace === :srgb || return c
+    return Color3(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b))
 end
 
 # ========================== Mipmaps ==========================
@@ -96,6 +119,129 @@ function sample_texture_lod(tex::Texture, u, v, lod::Int)
     return sample_texture(tmp, u, v)
 end
 
+"""
+    sample_texture_auto(tex, u, v, duv) -> Color3
+
+Sample with automatic level-of-detail selection from the per-pixel UV
+footprint `duv` (the maximum texel span covered by one screen pixel, as a
+fraction of the [0,1] UV range). The continuous LOD is
+
+    lod = clamp(log2(max(duv * size, 1)), 0, length(mipmaps))
+
+with `size = max(W, H)` the base texel dimension, mirroring the GPU mipmap
+selection used by three.js. The two bracketing integer levels are sampled
+with `sample_texture_lod` and trilinearly blended by the fractional part of
+`lod`. When the texture has no mipmaps the call falls back to
+`sample_texture`. The integer level choice is a discrete decision, but the
+blend weight is carried through unchanged so the result stays smooth for
+`ForwardDiff.Dual`/`ADVar` `duv`.
+"""
+function sample_texture_auto(tex::Texture, u, v, duv)
+    isempty(tex.mipmaps) && return sample_texture(tex, u, v)
+    H, W, _ = size(tex.data)
+    sz = max(W, H)
+    nlevels = length(tex.mipmaps)
+    # Continuous LOD; clamp to [0, nlevels]. Keep AD type for the blend weight.
+    # Use log(x)/log(2) rather than log2 so the reverse-mode `ADVar` path (which
+    # defines `log` but not `log2`) keeps its derivative instead of falling back
+    # to a value-only `float` conversion.
+    span = max(duv * sz, one(duv))
+    lod = clamp(log(span) / log(oftype(float(span), 2)), zero(duv), oftype(float(duv), nlevels))
+    lod_f = Float64(lod)                       # discrete-selection scalar
+    l0 = floor(Int, lod_f)
+    frac = lod - l0                            # fractional blend weight (AD-stable)
+    l1 = min(l0 + 1, nlevels)
+    c0 = sample_texture_lod(tex, u, v, l0)
+    frac <= 0 && return c0                      # exactly on a level
+    c1 = sample_texture_lod(tex, u, v, l1)
+    return c0 * (1 - frac) + c1 * frac
+end
+
+"""
+    sample_texture_aniso(tex, u, v, du, dv; max_aniso=8) -> Color3
+
+Anisotropic texture filtering. `(du, dv)` is the per-pixel UV-space footprint
+(the texel span one screen pixel covers along the U and V axes, expressed as a
+fraction of the [0,1] UV range, exactly the convention used by
+`sample_texture_auto`'s `duv`). The footprint is modeled as an axis-aligned
+ellipse with half-extents `|du|` and `|dv|`; its major axis is the larger
+extent and its minor axis the smaller.
+
+The sample count is `N = clamp(ceil(major/minor), 1, max_aniso)`. `N` probes
+are spread evenly along the *major* axis, centred on `(u, v)`, each taken at the
+level-of-detail implied by the *minor* axis footprint (via `sample_texture_auto`,
+which reuses the existing mipmaps). Averaging these probes integrates the long
+direction of the footprint while keeping the short direction sharp, which is
+exactly what isotropic bilinear/mip sampling blurs away at grazing angles.
+
+Fallback behaviour:
+- If `tex` has no mipmaps, or the footprint is (near-)isotropic
+  (`ratio < 1.5`), or `max_aniso <= 1`, a single isotropic sample is returned
+  (`sample_texture_auto` when mipmaps exist, else `sample_texture`).
+
+AD tolerance: the discrete decisions (`N`, the per-probe integer mip level) are
+made on `Float64` magnitudes, while the probe coordinates, the minor-axis
+`duv`, and the averaging weight `1/N` all flow through unchanged, so a
+`ForwardDiff.Dual`/`ADVar` `(u, v, du, dv)` keeps a smooth derivative through
+the returned color.
+"""
+function sample_texture_aniso(tex::Texture, u, v, du, dv; max_aniso::Int=8)
+    # Footprint extents along each UV axis (keep AD type for the live path).
+    adu = abs(du)
+    adv = abs(dv)
+    # Major/minor extents and the axis the major one lies on.
+    major = max(adu, adv)
+    minor = min(adu, adv)
+    major_is_u = adu >= adv
+
+    # Plain Float64 magnitudes for all discrete (non-differentiable) decisions.
+    major_f = Float64(major)
+    minor_f = Float64(minor)
+
+    # No mipmaps: anisotropic LOD selection is meaningless, fall back to bilinear.
+    isempty(tex.mipmaps) && return sample_texture(tex, u, v)
+
+    # Near-isotropic footprint, degenerate footprint, or anisotropy disabled:
+    # a single isotropic auto-LOD sample is correct and cheapest.
+    if max_aniso <= 1 || minor_f <= 0 || major_f <= 0
+        return sample_texture_auto(tex, u, v, major)
+    end
+    ratio = major_f / minor_f
+    if ratio < 1.5
+        return sample_texture_auto(tex, u, v, major)
+    end
+
+    # Number of probes along the major axis (discrete, value-only).
+    N = clamp(ceil(Int, ratio), 1, max_aniso)
+    if N <= 1
+        return sample_texture_auto(tex, u, v, major)
+    end
+
+    # The probes share the minor-axis LOD: sampling at the minor footprint keeps
+    # the short direction sharp; the spread along the major axis integrates the
+    # long direction. (`minor` carries the AD type into sample_texture_auto.)
+    duv_minor = minor
+
+    # The probes span the major axis symmetrically about (u,v): the footprint
+    # half-extent is `major`, so for N probes at fractional positions
+    # t_k = (k + 0.5)/N ∈ (0,1) the signed UV offset is (2 t_k - 1)*major.
+    invN = 1.0 / N
+    @inline probe(k) = begin
+        s = (2 * (k + 0.5) * invN) - 1.0        # Float64 stepping fraction in (-1, 1)
+        off = s * major                          # AD-typed signed UV offset
+        if major_is_u
+            sample_texture_auto(tex, u + off, v, duv_minor)
+        else
+            sample_texture_auto(tex, u, v + off, duv_minor)
+        end
+    end
+    acc = probe(0)                               # seeds the accumulator with the AD type
+    @inbounds for k in 1:(N - 1)
+        acc = acc + probe(k)
+    end
+    return acc * invN
+end
+
 # ========================== CubeTexture ==========================
 
 struct CubeTexture
@@ -107,13 +253,13 @@ function sample_cube(ct::CubeTexture, dir::Vec3)
     ax, ay, az = abs(dir.x), abs(dir.y), abs(dir.z)
     if ax >= ay && ax >= az
         if dir.x > 0; return sample_texture(ct.faces[1], 0.5 - dir.z/(2dir.x), 0.5 - dir.y/(2ax))
-        else;         return sample_texture(ct.faces[2], 0.5 - dir.z/(2dir.x), 0.5 + dir.y/(2ax)); end
+        else;         return sample_texture(ct.faces[2], 0.5 - dir.z/(2dir.x), 0.5 - dir.y/(2ax)); end
     elseif ay >= ax && ay >= az
         if dir.y > 0; return sample_texture(ct.faces[3], 0.5 + dir.x/(2ay), 0.5 + dir.z/(2dir.y))
-        else;         return sample_texture(ct.faces[4], 0.5 + dir.x/(2ay), 0.5 - dir.z/(2dir.y)); end
+        else;         return sample_texture(ct.faces[4], 0.5 + dir.x/(2ay), 0.5 - dir.z/(2ay)); end
     else
         if dir.z > 0; return sample_texture(ct.faces[5], 0.5 + dir.x/(2dir.z), 0.5 - dir.y/(2az))
-        else;         return sample_texture(ct.faces[6], 0.5 + dir.x/(2dir.z), 0.5 + dir.y/(2az)); end
+        else;         return sample_texture(ct.faces[6], 0.5 + dir.x/(2dir.z), 0.5 - dir.y/(2az)); end
     end
 end
 

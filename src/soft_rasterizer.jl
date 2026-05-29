@@ -18,7 +18,7 @@ struct SoftRasterizerConfig{T<:Real}
     eps::T
 end
 
-function SoftRasterizerConfig(; sigma=1e-2, gamma=1.0,
+function SoftRasterizerConfig(; sigma=1.0, gamma=1.0,
                                bg_color=Color3(0.0, 0.0, 0.0),
                                eps=1e-8)
     T = promote_type(typeof(sigma), typeof(gamma), typeof(bg_color.r), typeof(eps))
@@ -40,27 +40,37 @@ Arguments:
 
 Returns: Array{T, 3} of size (height, width, 3) — RGB image.
 """
-function soft_render(vertices::Vector{Vec3{T}},
+function soft_render(vertices::Vector{Vec3{Tv}},
                      faces::Vector{NTuple{3,Int}},
-                     face_colors::Vector{Color3{T}},
+                     face_colors::Vector{Color3{Tc}},
                      view_proj::Mat4,
                      width::Int, height::Int,
                      config::SoftRasterizerConfig = SoftRasterizerConfig()
-                     ) where T
+                     ) where {Tv, Tc}
 
-    σ = config.sigma
-    γ = config.gamma
-    bg = config.bg_color
-    eps = config.eps
+    # Promote to a common element type so the renderer is differentiable with
+    # respect to any subset of {vertices, colors, camera}: e.g. Dual vertices
+    # with fixed Float64 colors. The common path (all the same type) hits the
+    # `=== T` short-circuits and performs no extra work or allocation.
+    T = promote_type(Tv, Tc, eltype(view_proj.e), typeof(config.sigma),
+                     typeof(config.gamma), typeof(config.bg_color.r), typeof(config.eps))
+    verts = Tv === T ? vertices : Vec3{T}[Vec3(T(v.x), T(v.y), T(v.z)) for v in vertices]
+    cols  = Tc === T ? face_colors : Color3{T}[Color3(T(c.r), T(c.g), T(c.b)) for c in face_colors]
+    vp    = eltype(view_proj.e) === T ? view_proj : Mat4{T}(ntuple(k -> T(view_proj.e[k]), 16))
+
+    σ = T(config.sigma)
+    γ = T(config.gamma)
+    bg = Color3(T(config.bg_color.r), T(config.bg_color.g), T(config.bg_color.b))
+    eps = T(config.eps)
 
     n_faces = length(faces)
     W, H = width, height
 
     # Project all vertices to screen space
-    screen_verts = Vector{Vec3{T}}(undef, length(vertices))
-    ndc_verts = Vector{Vec3{T}}(undef, length(vertices))
-    for (vi, v) in enumerate(vertices)
-        clip = mat4_transform_vec4(view_proj, Vec4(v.x, v.y, v.z, one(T)))
+    screen_verts = Vector{Vec3{T}}(undef, length(verts))
+    ndc_verts = Vector{Vec3{T}}(undef, length(verts))
+    for (vi, v) in enumerate(verts)
+        clip = mat4_transform_vec4(vp, Vec4(v.x, v.y, v.z, one(T)))
         if clip.w > eps
             ndc = Vec3(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w)
             ndc_verts[vi] = ndc
@@ -84,68 +94,157 @@ function soft_render(vertices::Vector{Vec3{T}},
         s3 = screen_verts[i3]
         area = edge_function(s1.x, s1.y, s2.x, s2.y, s3.x, s3.y)
 
-        # Extended bounding box for soft edges
-        margin = 3.0 / max(σ, eps)
-        margin = min(margin, 50.0)  # cap to prevent huge bboxes
+        # Extended bounding box for soft edges. The soft-coverage sigmoid
+        # sigmoid(d/σ) extends ~3σ pixels OUTSIDE the triangle, so the
+        # influence band GROWS with σ. Grow the margin with σ (floor ~1px,
+        # cap 50px) so larger σ is not truncated at the bbox edge.
+        margin = clamp(3.0 * σ, 1.0, 50.0)
         bmin_x = max(floor(Int, min(s1.x, s2.x, s3.x) - margin), 1)
         bmax_x = min(ceil(Int, max(s1.x, s2.x, s3.x) + margin), W)
         bmin_y = max(floor(Int, min(s1.y, s2.y, s3.y) - margin), 1)
         bmax_y = min(ceil(Int, max(s1.y, s2.y, s3.y) + margin), H)
 
         valid = abs(area) > eps && bmax_x >= bmin_x && bmax_y >= bmin_y
-        screen_tris[fi] = (s1=s1, s2=s2, s3=s3, color=face_colors[fi],
+        screen_tris[fi] = (s1=s1, s2=s2, s3=s3, color=cols[fi],
                            min_x=bmin_x, max_x=bmax_x, min_y=bmin_y, max_y=bmax_y,
                            area=area, valid=valid)
+    end
+
+    # --------------------------------------------------------------------
+    # Spatial acceleration: uniform tile grid.
+    #
+    # The original per-pixel cost is O(pixels x faces) because every pixel
+    # scans all faces and rejects those whose margin-expanded bbox does not
+    # cover it. We bin each face into every tile its bbox overlaps, then the
+    # per-pixel loop only visits the faces registered to that pixel's tile.
+    #
+    # Numerical equivalence: a face contributes to pixel (px, py) iff
+    #   tri.min_x <= px <= tri.max_x && tri.min_y <= py <= tri.max_y.
+    # A pixel in tile (tx, ty) lies inside the tile's pixel span, so any face
+    # whose bbox covers that pixel also overlaps the tile and is therefore
+    # registered to it. The tile list is thus a SUPERSET of the covering
+    # faces; the unchanged inner bbox test rejects the extras. The retained
+    # faces, their order (ascending face index per tile), coverage, and depth
+    # weights are identical to the all-faces scan, so the floating-point
+    # result and the gradients that flow through it are unchanged. Tile bounds
+    # are taken from the Float64-precision (or Dual-value) screen bbox already
+    # stored in screen_tris, so binning introduces no new differentiable path.
+    # --------------------------------------------------------------------
+    TILE = 16
+    n_tx = cld(W, TILE)
+    n_ty = cld(H, TILE)
+    n_tiles = n_tx * n_ty
+    @inline tile_index(tx, ty) = (ty - 1) * n_tx + tx
+    @inline tile_x_of(px) = (px - 1) ÷ TILE + 1
+    @inline tile_y_of(py) = (py - 1) ÷ TILE + 1
+
+    # Bucket faces into tiles. Two-pass CSR build keeps allocation O(faces +
+    # tile-overlap entries) and gives contiguous, index-ordered per-tile lists.
+    tile_counts = zeros(Int, n_tiles)
+    for fi in 1:n_faces
+        tri = screen_tris[fi]
+        tri.valid || continue
+        tx0 = tile_x_of(tri.min_x); tx1 = tile_x_of(tri.max_x)
+        ty0 = tile_y_of(tri.min_y); ty1 = tile_y_of(tri.max_y)
+        for ty in ty0:ty1, tx in tx0:tx1
+            tile_counts[tile_index(tx, ty)] += 1
+        end
+    end
+    tile_offsets = Vector{Int}(undef, n_tiles + 1)
+    tile_offsets[1] = 1
+    for t in 1:n_tiles
+        tile_offsets[t + 1] = tile_offsets[t] + tile_counts[t]
+    end
+    tile_faces = Vector{Int}(undef, tile_offsets[n_tiles + 1] - 1)
+    tile_cursor = copy(tile_offsets)
+    for fi in 1:n_faces
+        tri = screen_tris[fi]
+        tri.valid || continue
+        tx0 = tile_x_of(tri.min_x); tx1 = tile_x_of(tri.max_x)
+        ty0 = tile_y_of(tri.min_y); ty1 = tile_y_of(tri.max_y)
+        for ty in ty0:ty1, tx in tx0:tx1
+            t = tile_index(tx, ty)
+            tile_faces[tile_cursor[t]] = fi
+            tile_cursor[t] += 1
+        end
     end
 
     # Render each pixel
     image = Array{T}(undef, H, W, 3)
     for py in 1:H
+        ty = tile_y_of(py)
         for px in 1:W
             cx = T(px) - T(0.5)
             cy = T(py) - T(0.5)
 
-            # Accumulate soft contributions from all faces
+            t = tile_index(tile_x_of(px), ty)
+            face_lo = tile_offsets[t]
+            face_hi = tile_offsets[t + 1] - 1
+
+            # Soft aggregation over faces using a numerically stabilized
+            # softmax over face depth. The depth weight is exp(-z_face/γ);
+            # without max-subtraction the exponent overflows to Inf/NaN for
+            # large +arg or underflows so total_weight < eps for small γ.
+            #
+            # Pass 1: compute each covered face's coverage and exponent arg
+            #   e_f = -z_face/γ, tracking the per-pixel max arg m. The
+            #   max-subtraction cancels in the normalized blend, so this is
+            #   mathematically equivalent for moderate γ. (γ is in NDC-depth
+            #   units.) Only the faces binned to this pixel's tile are visited.
+            m = T(-Inf)
+            any_face = false
+            for k in face_lo:face_hi
+                fi = tile_faces[k]
+                tri = screen_tris[fi]
+                !(tri.min_x <= px <= tri.max_x && tri.min_y <= py <= tri.max_y) && continue
+                z_face = (tri.s1.z + tri.s2.z + tri.s3.z) / 3
+                e_f = -z_face / γ
+                if e_f > m
+                    m = e_f
+                end
+                any_face = true
+            end
+
+            # Pass 2: stabilized weights weight_f = coverage_f * exp(e_f - m).
             total_weight = zero(T)
             color_r = zero(T)
             color_g = zero(T)
             color_b = zero(T)
+            if any_face
+                for k in face_lo:face_hi
+                    fi = tile_faces[k]
+                    tri = screen_tris[fi]
+                    !(tri.min_x <= px <= tri.max_x && tri.min_y <= py <= tri.max_y) && continue
 
-            for fi in 1:n_faces
-                tri = screen_tris[fi]
-                !tri.valid && continue
-                !(tri.min_x <= px <= tri.max_x && tri.min_y <= py <= tri.max_y) && continue
+                    # Signed distance to triangle (minimum distance to any edge)
+                    d = signed_distance_to_triangle(cx, cy,
+                        tri.s1.x, tri.s1.y, tri.s2.x, tri.s2.y, tri.s3.x, tri.s3.y)
 
-                # Signed distance to triangle (minimum distance to any edge)
-                d = signed_distance_to_triangle(cx, cy,
-                    tri.s1.x, tri.s1.y, tri.s2.x, tri.s2.y, tri.s3.x, tri.s3.y)
+                    # Soft coverage via sigmoid
+                    coverage = sigmoid_approx(d / σ)
 
-                # Soft coverage via sigmoid
-                coverage = sigmoid_approx(d / σ)
+                    # Stabilized depth-based weighting
+                    z_face = (tri.s1.z + tri.s2.z + tri.s3.z) / 3
+                    e_f = -z_face / γ
+                    depth_weight = exp(e_f - m)
 
-                # Depth-based weighting
-                z_face = (tri.s1.z + tri.s2.z + tri.s3.z) / 3
-                depth_weight = exp(-z_face / γ)
-
-                w = coverage * depth_weight
-                total_weight += w
-                color_r += w * tri.color.r
-                color_g += w * tri.color.g
-                color_b += w * tri.color.b
+                    w = coverage * depth_weight
+                    total_weight += w
+                    color_r += w * tri.color.r
+                    color_g += w * tri.color.g
+                    color_b += w * tri.color.b
+                end
             end
 
-            if total_weight > eps
-                inv_w = one(T) / total_weight
-                # Blend with background
-                alpha = one(T) - exp(-total_weight)
-                image[py, px, 1] = alpha * color_r * inv_w + (one(T) - alpha) * bg.r
-                image[py, px, 2] = alpha * color_g * inv_w + (one(T) - alpha) * bg.g
-                image[py, px, 3] = alpha * color_b * inv_w + (one(T) - alpha) * bg.b
-            else
-                image[py, px, 1] = bg.r
-                image[py, px, 2] = bg.g
-                image[py, px, 3] = bg.b
-            end
+            # Unconditional smooth blend. alpha = 1 - exp(-total_weight) -> 0 as
+            # total_weight -> 0, so the pixel decays to background without a
+            # discrete branch. The normalization is guarded against
+            # divide-by-zero by a smooth eps add (no hard threshold).
+            alpha = one(T) - exp(-total_weight)
+            inv_w = one(T) / (total_weight + eps)
+            image[py, px, 1] = alpha * color_r * inv_w + (one(T) - alpha) * bg.r
+            image[py, px, 2] = alpha * color_g * inv_w + (one(T) - alpha) * bg.g
+            image[py, px, 3] = alpha * color_b * inv_w + (one(T) - alpha) * bg.b
         end
     end
 
@@ -224,7 +323,7 @@ Suitable for wrapping in ForwardDiff.
 """
 function soft_render_scene(scene::Scene, camera::AbstractCamera,
                            width::Int, height::Int;
-                           sigma=1e-4, gamma=1e-4)
+                           sigma=1.0, gamma=1.0)
     config = SoftRasterizerConfig(sigma=sigma, gamma=gamma, bg_color=scene.background)
 
     proj = projection_matrix(camera)
@@ -273,7 +372,7 @@ Differentiable render with explicit parameters for AD.
 function differentiable_render(params::AbstractVector{T},
                                setup_fn::Function,
                                width::Int, height::Int;
-                               sigma=1e-4, gamma=1e-4) where T
+                               sigma=1.0, gamma=1.0) where T
     # setup_fn returns (vertices, faces, face_colors, view_proj, bg_color)
     vertices, faces, face_colors, vp, bg = setup_fn(params)
     config = SoftRasterizerConfig(sigma=sigma, gamma=gamma, bg_color=bg)

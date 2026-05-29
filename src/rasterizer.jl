@@ -23,7 +23,41 @@ function clear!(rt::RenderTarget, bg::Color3)
     rt.depth .= eltype(rt.depth)(Inf)
 end
 
+# Scissor-limited clear: only the pixel rectangle [xlo:xhi, ylo:yhi] (inclusive,
+# 1-based, already clamped to the buffer) is cleared. Pixels outside the scissor
+# rectangle are left untouched, matching three.js `setScissor` + `setScissorTest`
+# behaviour where clears are restricted to the scissor box. The full-frame
+# `clear!` above is unchanged and is used when scissor testing is off.
+function clear_rect!(rt::RenderTarget, bg::Color3, xlo::Int, xhi::Int, ylo::Int, yhi::Int)
+    (xhi < xlo || yhi < ylo) && return rt
+    @inbounds for px in xlo:xhi, py in ylo:yhi
+        rt.color[py, px, 1] = bg.r
+        rt.color[py, px, 2] = bg.g
+        rt.color[py, px, 3] = bg.b
+        rt.depth[py, px] = eltype(rt.depth)(Inf)
+    end
+    return rt
+end
+
 @inline _camera_near(c::AbstractCamera) = c.near
+@inline _camera_far(c::AbstractCamera) = c.far
+
+# Logarithmic depth encoding (three.js `logarithmicDepthBuffer`, interpolated-
+# varying fallback). Given the clip-space `w` of a vertex (for a perspective
+# camera, `w` is the positive view-space distance to the camera plane), encode
+#
+#     z_log = log2(max(1e-6, w + 1)) / log2(far + 1)
+#
+# `inv_log_far = 1 / log2(far + 1)` is precomputed once per frame. The encoding is
+# monotonically increasing in distance and lands in roughly [0, 1] for w in
+# [0, far], so the existing "smaller depth wins" z-test (`z < depth`) keeps the
+# nearer fragment exactly as with NDC z. Spreading precision logarithmically keeps
+# usable resolution across very large far/near ratios where linear NDC z collapses
+# almost entirely onto the far plane. Three.js without `EXT_frag_depth`
+# interpolates this value as a vertex varying; this rasterizer matches that by
+# encoding per clipped vertex and letting the barycentric depth interpolation
+# carry the encoded value, so no per-fragment log is required.
+@inline _encode_log_depth(w, inv_log_far) = log2(max(1.0e-6, w + 1.0)) * inv_log_far
 
 # Intersect view-space edge a→b with the near plane (view-space z = -near).
 @inline function _clip_intersect_near(a::Vec4, b::Vec4, near)
@@ -52,18 +86,43 @@ function _clip_near!(out::Vector{Vec4{T}}, verts::Vector{Vec4{T}}, n::Int, near)
     return length(out)
 end
 
+# Shared empty/zero constants so the no-clip path threads typed defaults without
+# allocating per call.
+const _NO_PLANES = Plane{Float64}[]
+const _ZERO_V3 = Vec3(0.0, 0.0, 0.0)
+
+# A fragment lies on the "kept" side of every clipping plane when its signed
+# distance is non-negative for all of them (three.js `clippingPlanes`: a plane
+# clips away the half-space on the negative side of its normal). With no planes
+# this is a no-op. `wp` is the fragment's interpolated world position.
+@inline function _clip_keep(planes, wp::Vec3)
+    @inbounds for pl in planes
+        plane_distance_to_point(pl, wp) < 0 && return false
+    end
+    return true
+end
+
 # Rasterize one screen-space triangle (flat color) with z-buffer. `ylo`/`yhi`
-# clamp the scanline range so a tiled renderer can restrict output to a band.
+# and `xlo`/`xhi` clamp the scanline/column range so a tiled renderer can restrict
+# output to a band and so scissor testing can restrict output to a pixel box.
+# When `clipping_planes` is non-empty, each fragment's world position is
+# barycentrically interpolated from the triangle's world vertices `wp1/wp2/wp3`
+# and the fragment is discarded if it falls on the negative side of any plane.
 @inline function _rasterize_tri!(rt::RenderTarget, s1x, s1y, z1, s2x, s2y, z2,
-                                 s3x, s3y, z3, fc::Color3, ylo::Int=1, yhi::Int=typemax(Int))
+                                 s3x, s3y, z3, fc::Color3, ylo::Int=1, yhi::Int=typemax(Int);
+                                 xlo::Int=1, xhi::Int=typemax(Int),
+                                 clipping_planes=_NO_PLANES,
+                                 wp1::Vec3=_ZERO_V3, wp2::Vec3=_ZERO_V3, wp3::Vec3=_ZERO_V3,
+                                 iw1::Float64=1.0, iw2::Float64=1.0, iw3::Float64=1.0)
     W, H = rt.width, rt.height
     area = edge_function(s1x, s1y, s2x, s2y, s3x, s3y)
     abs(area) < 1e-10 && return nothing
     inv_area = 1.0 / area
-    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1)
-    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W)
+    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1, xlo)
+    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W, xhi)
     min_y = max(floor(Int, min(s1y, s2y, s3y)), 1, ylo)
     max_y = min(ceil(Int, max(s1y, s2y, s3y)), H, yhi)
+    has_clip = !isempty(clipping_planes)
     @inbounds for py in min_y:max_y
         for px in min_x:max_x
             cx = px - 0.5
@@ -74,6 +133,15 @@ end
             if w0 >= 0 && w1 >= 0 && w2 >= 0
                 z = w0 * z1 + w1 * z2 + w2 * z3
                 if z < rt.depth[py, px]
+                    if has_clip
+                        # Perspective-correct world position (weight by 1/w).
+                        iw = w0*iw1 + w1*iw2 + w2*iw3
+                        a0 = w0*iw1/iw; a1 = w1*iw2/iw; a2 = w2*iw3/iw
+                        wp = Vec3(a0*wp1.x + a1*wp2.x + a2*wp3.x,
+                                  a0*wp1.y + a1*wp2.y + a2*wp3.y,
+                                  a0*wp1.z + a1*wp2.z + a2*wp3.z)
+                        _clip_keep(clipping_planes, wp) || continue
+                    end
                     rt.depth[py, px] = z
                     rt.color[py, px, 1] = fc.r
                     rt.color[py, px, 2] = fc.g
@@ -97,13 +165,15 @@ struct ShadeVtx
     vp::Vec4{Float64}   # view-space position (for near-plane clipping)
     wp::Vec3{Float64}   # world-space position
     wn::Vec3{Float64}   # world-space normal (unnormalised; normalised per pixel)
+    uv::Vec2{Float64}   # texture coordinate (for per-pixel material maps)
 end
 
 @inline function _lerp_shadevtx(a::ShadeVtx, b::ShadeVtx, t)
     ShadeVtx(Vec4(a.vp.x + t*(b.vp.x - a.vp.x), a.vp.y + t*(b.vp.y - a.vp.y),
                   a.vp.z + t*(b.vp.z - a.vp.z), a.vp.w + t*(b.vp.w - a.vp.w)),
              Vec3(a.wp.x + t*(b.wp.x - a.wp.x), a.wp.y + t*(b.wp.y - a.wp.y), a.wp.z + t*(b.wp.z - a.wp.z)),
-             Vec3(a.wn.x + t*(b.wn.x - a.wn.x), a.wn.y + t*(b.wn.y - a.wn.y), a.wn.z + t*(b.wn.z - a.wn.z)))
+             Vec3(a.wn.x + t*(b.wn.x - a.wn.x), a.wn.y + t*(b.wn.y - a.wn.y), a.wn.z + t*(b.wn.z - a.wn.z)),
+             Vec2(a.uv.x + t*(b.uv.x - a.uv.x), a.uv.y + t*(b.uv.y - a.uv.y)))
 end
 
 function _clip_near_attr!(out::Vector{ShadeVtx}, verts::Vector{ShadeVtx}, n::Int, near)
@@ -127,19 +197,31 @@ function _clip_near_attr!(out::Vector{ShadeVtx}, verts::Vector{ShadeVtx}, n::Int
     return length(out)
 end
 
+# Per-pixel (smooth) triangle. World position and normal are interpolated
+# perspective-correctly, then the shading model is evaluated per pixel. When the
+# material carries a UV-indexed albedo/normal map, the texture coordinate is also
+# interpolated perspective-correctly and the maps are applied per pixel using the
+# same helpers (`sample_texture`, `_apply_normal_map`) as the flat path — so a
+# textured surface looks identical under flat and smooth shading. `clipping_planes`
+# discards fragments on the negative side of any plane (interpolated world pos).
 @inline function _rasterize_tri_smooth!(rt::RenderTarget,
-        s1x, s1y, z1, iw1, wp1::Vec3, wn1::Vec3,
-        s2x, s2y, z2, iw2, wp2::Vec3, wn2::Vec3,
-        s3x, s3y, z3, iw3, wp3::Vec3, wn3::Vec3,
-        material::AbstractMaterial, lights, cam_pos::Vec3, shadow_fn)
+        s1x, s1y, z1, iw1, wp1::Vec3, wn1::Vec3, uv1::Vec2,
+        s2x, s2y, z2, iw2, wp2::Vec3, wn2::Vec3, uv2::Vec2,
+        s3x, s3y, z3, iw3, wp3::Vec3, wn3::Vec3, uv3::Vec2,
+        material::AbstractMaterial, lights, cam_pos::Vec3, shadow_fn,
+        albedo_map, normal_map, clipping_planes;
+        xlo::Int=1, xhi::Int=typemax(Int), ylo::Int=1, yhi::Int=typemax(Int))
     W, H = rt.width, rt.height
     area = edge_function(s1x, s1y, s2x, s2y, s3x, s3y)
     abs(area) < 1e-10 && return nothing
     inv_area = 1.0 / area
-    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1)
-    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W)
-    min_y = max(floor(Int, min(s1y, s2y, s3y)), 1)
-    max_y = min(ceil(Int, max(s1y, s2y, s3y)), H)
+    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1, xlo)
+    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W, xhi)
+    min_y = max(floor(Int, min(s1y, s2y, s3y)), 1, ylo)
+    max_y = min(ceil(Int, max(s1y, s2y, s3y)), H, yhi)
+    has_albedo = albedo_map !== nothing
+    has_normalmap = normal_map !== nothing
+    has_clip = !isempty(clipping_planes)
     @inbounds for py in min_y:max_y
         for px in min_x:max_x
             cx = px - 0.5
@@ -156,11 +238,28 @@ end
             wp = Vec3(a0*wp1.x + a1*wp2.x + a2*wp3.x,
                       a0*wp1.y + a1*wp2.y + a2*wp3.y,
                       a0*wp1.z + a1*wp2.z + a2*wp3.z)
+            has_clip && (_clip_keep(clipping_planes, wp) || continue)
             wn = normalize(Vec3(a0*wn1.x + a1*wn2.x + a2*wn3.x,
                                 a0*wn1.y + a1*wn2.y + a2*wn3.y,
                                 a0*wn1.z + a1*wn2.z + a2*wn3.z))
-            vd = normalize(cam_pos - wp)
-            col = clamp_color(shade_face(wn, vd, wp, material, lights; shadow_fn=shadow_fn))
+            # Perspective-correct UV, computed only when a map is active so the
+            # no-map path keeps its original per-pixel cost.
+            if has_albedo || has_normalmap
+                u = a0*uv1.x + a1*uv2.x + a2*uv3.x
+                v = a0*uv1.y + a1*uv2.y + a2*uv3.y
+                # normalMap perturbs the shading normal before lighting (same
+                # helper as the flat path); the tangent frame uses the triangle's
+                # world vertices and per-vertex UVs.
+                has_normalmap && (wn = _apply_normal_map(wn, normal_map, u, v, wp1, wp2, wp3,
+                                                         (uv1.x, uv1.y), (uv2.x, uv2.y), (uv3.x, uv3.y)))
+                vd = normalize(cam_pos - wp)
+                col = shade_face(wn, vd, wp, material, lights; shadow_fn=shadow_fn)
+                has_albedo && (col = col * sample_texture(albedo_map, u, v))
+            else
+                vd = normalize(cam_pos - wp)
+                col = shade_face(wn, vd, wp, material, lights; shadow_fn=shadow_fn)
+            end
+            col = clamp_color(col)
             rt.depth[py, px] = z
             rt.color[py, px, 1] = col.r
             rt.color[py, px, 2] = col.g
@@ -170,7 +269,10 @@ end
     return nothing
 end
 
-function _render_smooth!(rt::RenderTarget, meshes, lights, proj, view, near, cam_pos, shadow_fn=nothing)
+function _render_smooth!(rt::RenderTarget, meshes, lights, proj, view, near, cam_pos, shadow_fn=nothing;
+                         clipping_planes=_NO_PLANES,
+                         xlo::Int=1, xhi::Int=typemax(Int), ylo::Int=1, yhi::Int=typemax(Int),
+                         log_depth::Bool=false, inv_log_far::Float64=1.0)
     W, H = rt.width, rt.height
     tri = Vector{ShadeVtx}(undef, 3)
     clipped = ShadeVtx[]; sizehint!(clipped, 6)
@@ -183,15 +285,35 @@ function _render_smooth!(rt::RenderTarget, meshes, lights, proj, view, near, cam
         normal_mat = mat4_transpose(mat4_inverse(world_mat))
         geo = mesh.geometry
         mat = mesh.material
+        # Back-face culling, matching the flat path (`_rasterize_geo_flat!`): the
+        # per-pixel path must agree with the per-face path on which faces survive.
+        side = material_side(mat)
+        has_normals = length(geo.normals) >= geo.n_vertices * 3
+        # Per-pixel material maps (albedo + normalMap), applied only when the
+        # geometry carries UVs and the material exposes the map. Matches the flat
+        # path's `map`/`normal_map` handling so textured surfaces agree.
+        has_uvs = length(geo.uvs) >= geo.n_vertices * 2
+        albedo_map = has_uvs ? _material_field(mat, :map) : nothing
+        normal_map = has_uvs ? _material_field(mat, :normal_map) : nothing
         for fi in 1:geo.n_faces
             i1, i2, i3 = get_face(geo, fi)
+            if side !== :double
+                w1 = mat4_transform_point(world_mat, get_vertex(geo, i1))
+                w2 = mat4_transform_point(world_mat, get_vertex(geo, i2))
+                w3 = mat4_transform_point(world_mat, get_vertex(geo, i3))
+                wc = Vec3((w1.x+w2.x+w3.x)/3, (w1.y+w2.y+w3.y)/3, (w1.z+w2.z+w3.z)/3)
+                fn = _flat_face_normal(geo, i1, i2, i3, w1, w2, w3, normal_mat, has_normals)
+                facing = dot(fn, cam_pos - wc)
+                (side === :front ? facing <= 0 : facing > 0) && continue
+            end
             @inbounds for (slot, vi) in ((1, i1), (2, i2), (3, i3))
                 v = get_vertex(geo, vi)
                 nrm = get_normal(geo, vi)
                 wp = mat4_transform_point(world_mat, v)
                 wn = mat4_transform_direction(normal_mat, nrm)
                 vp = mat4_transform_vec4(modelview, Vec4(v.x, v.y, v.z, 1.0))
-                tri[slot] = ShadeVtx(vp, wp, wn)
+                uv = has_uvs ? Vec2(geo.uvs[(vi-1)*2+1], geo.uvs[(vi-1)*2+2]) : Vec2(0.0, 0.0)
+                tri[slot] = ShadeVtx(vp, wp, wn, uv)
             end
             m = _clip_near_attr!(clipped, tri, 3, near)
             m < 3 && continue
@@ -200,15 +322,20 @@ function _render_smooth!(rt::RenderTarget, meshes, lights, proj, view, near, cam
                 invw = 1.0 / cv.w
                 sx[k] = (cv.x * invw + 1) * 0.5 * W
                 sy[k] = (1 - cv.y * invw) * 0.5 * H
-                sz[k] = cv.z * invw
+                # Depth stored in the z-buffer: NDC z by default, or the
+                # logarithmic encoding of the clip-space w (= view distance) when
+                # `log_depth` is set. Both are monotone in distance so the z-test
+                # is unchanged; the encoded value is interpolated as a varying.
+                sz[k] = log_depth ? _encode_log_depth(cv.w, inv_log_far) : cv.z * invw
                 iw[k] = invw
             end
             @inbounds for k in 2:(m - 1)
                 _rasterize_tri_smooth!(rt,
-                    sx[1], sy[1], sz[1], iw[1], clipped[1].wp, clipped[1].wn,
-                    sx[k], sy[k], sz[k], iw[k], clipped[k].wp, clipped[k].wn,
-                    sx[k+1], sy[k+1], sz[k+1], iw[k+1], clipped[k+1].wp, clipped[k+1].wn,
-                    mat, lights, cam_pos, shadow_fn)
+                    sx[1], sy[1], sz[1], iw[1], clipped[1].wp, clipped[1].wn, clipped[1].uv,
+                    sx[k], sy[k], sz[k], iw[k], clipped[k].wp, clipped[k].wn, clipped[k].uv,
+                    sx[k+1], sy[k+1], sz[k+1], iw[k+1], clipped[k+1].wp, clipped[k+1].wn, clipped[k+1].uv,
+                    mat, lights, cam_pos, shadow_fn, albedo_map, normal_map, clipping_planes;
+                    xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi)
             end
         end
     end
@@ -228,22 +355,88 @@ reused across faces to keep per-frame allocation bounded.
 `shading=:flat` (default) evaluates one colour per face (fast). `shading=:smooth`
 interpolates per-vertex world position and normal perspective-correctly and
 shades each pixel, matching three.js smooth shading.
+
+`frustum_cull=true` (default) skips any mesh whose world-space bounding sphere
+lies entirely outside the camera view-projection frustum (three.js
+`frustumCulled`). It never changes the image for in-view meshes; set it `false`
+to draw every mesh unconditionally.
+
+`clipping_planes` (default empty) is a set of world-space [`Plane`](@ref)s. Each
+fragment on the negative side of any plane is discarded (three.js
+`renderer.clippingPlanes`), applied per pixel in both the flat and smooth paths.
+
+`scissor_test=false` and `scissor=nothing` mirror the WebGLRenderer scissor state
+(`setScissorTest`, `setScissor`). When `scissor_test` is set and a rectangle
+`scissor = (x, y, w, h)` is supplied, both the background clear and every
+rasterized fragment are clamped to that pixel box, leaving the rest of the target
+untouched. The rectangle uses the same top-left origin as the render target's
+pixel array: `x` is the 0-based left column, `y` is the 0-based top row, and
+`w`/`h` are the box width/height in pixels (this differs from WebGL's bottom-left
+origin and is the natural convention for this row-major top-left image buffer).
+The box is clamped to the buffer, so partially off-screen rectangles are safe.
+
+`sort_objects=true` mirrors `WebGLRenderer.sortObjects`: opaque meshes are drawn
+front-to-back by view-space depth to reduce overdraw work. Because the z-buffer
+makes opaque rendering order-independent, this changes only the draw order, not
+the final pixels. Transparent meshes keep their back-to-front order, which is
+required for correct alpha blending.
+
+`logarithmic_depth=false` mirrors `WebGLRenderer.logarithmicDepthBuffer`. When
+enabled, the z-buffer stores `log2(max(1e-6, w + 1)) / log2(far + 1)` (with `w`
+the clip-space w, i.e. the positive view distance) instead of NDC z. The encoding
+is monotone in distance, so the "nearer fragment wins" depth test is unchanged,
+while precision is spread logarithmically to stay usable across very large
+far/near ratios where linear NDC z collapses onto the far plane. The encoding is
+interpolated as a vertex varying across each triangle, matching three.js without
+`EXT_frag_depth`. It is applied to the opaque and transparent mesh passes; sprite,
+line, and point primitives continue to write NDC z, so enable it for scenes whose
+occlusion is dominated by mesh geometry.
 """
 function render!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
-                 shading::Symbol=:flat, shadows::Bool=false, shadow_resolution::Int=512)
-    clear!(rt, scene.background)
-
+                 shading::Symbol=:flat, shadows::Bool=false, shadow_resolution::Int=512,
+                 frustum_cull::Bool=true, clipping_planes::AbstractVector{<:Plane}=_NO_PLANES,
+                 scissor::Union{Nothing,NTuple{4,Int}}=nothing, scissor_test::Bool=false,
+                 sort_objects::Bool=true, logarithmic_depth::Bool=false)
     proj = projection_matrix(camera)
     view = view_matrix(camera)
     near = _camera_near(camera)
+    far = _camera_far(camera)
     W, H = rt.width, rt.height
 
     (shading === :flat || shading === :smooth) ||
         throw(ArgumentError("shading must be :flat or :smooth, got :$shading"))
 
+    # Scissor rectangle → inclusive 1-based pixel bounds, clamped to the buffer.
+    # Active only when scissor testing is on and a rectangle is supplied; otherwise
+    # the full target is used (xlo=ylo=1, xhi=W, yhi=H).
+    use_scissor = scissor_test && scissor !== nothing
+    xlo = 1; xhi = W; ylo = 1; yhi = H
+    if use_scissor
+        sxr, syr, swr, shr = scissor
+        xlo = max(1, sxr + 1); xhi = min(W, sxr + swr)
+        ylo = max(1, syr + 1); yhi = min(H, syr + shr)
+    end
+
+    # Clear: full frame normally, or only the scissor box under scissor testing.
+    if use_scissor
+        clear_rect!(rt, scene.background, xlo, xhi, ylo, yhi)
+    else
+        clear!(rt, scene.background)
+    end
+
+    # Logarithmic depth uses the clip-space w as the view distance, which only
+    # carries distance under a perspective projection. Orthographic clip w is
+    # constant, so the encoding would flatten all depths; fall back to NDC z there.
+    log_depth = logarithmic_depth && (camera isa PerspectiveCamera)
+    # Precompute 1/log2(far+1) once per frame for the logarithmic depth encoding.
+    inv_log_far = log_depth ? 1.0 / log2(far + 1.0) : 1.0
+
     meshes = collect_meshes(scene)
     lights = collect_lights(scene)
     shadow_fn = shadows ? _build_shadow_query(scene, lights; resolution=shadow_resolution) : nothing
+
+    # View-projection frustum for culling whole meshes that fall offscreen.
+    frustum = frustum_cull ? frustum_from_matrix(proj * view) : nothing
 
     # Reused scratch buffers (bounded allocation per frame).
     tri = Vector{Vec4{Float64}}(undef, 3)
@@ -254,20 +447,39 @@ function render!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
     sz = Vector{Float64}(undef, 8)
 
     # Opaque pass first (writes the depth buffer). Per-mesh shading mode honours
-    # the mesh's `flat_shading` override, else the renderer default.
+    # the mesh's `flat_shading` override, else the renderer default. Opaque meshes
+    # are collected (not drawn inline) so they can optionally be drawn front-to-
+    # back; the z-buffer keeps opaque output order-independent, so this affects
+    # only overdraw work, never the final pixels.
     transparent = Mesh[]
+    opaque_flat = Mesh[]
     smooth_meshes = Mesh[]
     for mesh in meshes
         !is_visible(mesh) && continue
+        wm = compute_world_matrix(mesh)
+        (frustum === nothing || _mesh_in_frustum(frustum, mesh.geometry, wm)) || continue
         if is_transparent_material(mesh.material)
             push!(transparent, mesh)
         elseif _mesh_is_flat(mesh, shading)
-            _rasterize_geo_flat!(rt, mesh.geometry, compute_world_matrix(mesh), mesh.material,
-                                 lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
-                                 shadow_fn=shadow_fn)
+            push!(opaque_flat, mesh)
         else
             push!(smooth_meshes, mesh)
         end
+    end
+
+    # Front-to-back draw order for opaque meshes (nearest first = largest, least-
+    # negative view-space z). Pure draw-order optimisation; pixels are unchanged.
+    if sort_objects
+        sort!(opaque_flat, by = m -> -_mesh_view_depth(m, view))
+        sort!(smooth_meshes, by = m -> -_mesh_view_depth(m, view))
+    end
+
+    for mesh in opaque_flat
+        _rasterize_geo_flat!(rt, mesh.geometry, compute_world_matrix(mesh), mesh.material,
+                             lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
+                             shadow_fn=shadow_fn, clipping_planes=clipping_planes,
+                             xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi,
+                             log_depth=log_depth, inv_log_far=inv_log_far)
     end
 
     # InstancedMesh: same geometry/material drawn at each instance transform (flat).
@@ -277,16 +489,23 @@ function render!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
         for M in im.instance_matrices
             _rasterize_geo_flat!(rt, im.geometry, base * M, im.material,
                                  lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
-                                 shadow_fn=shadow_fn)
+                                 shadow_fn=shadow_fn, clipping_planes=clipping_planes,
+                                 xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi,
+                                 log_depth=log_depth, inv_log_far=inv_log_far)
         end
     end
 
     # Smooth (per-pixel) opaque meshes share the same depth buffer.
     isempty(smooth_meshes) ||
-        _render_smooth!(rt, smooth_meshes, lights, proj, view, near, camera.position, shadow_fn)
+        _render_smooth!(rt, smooth_meshes, lights, proj, view, near, camera.position, shadow_fn;
+                        clipping_planes=clipping_planes,
+                        xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi,
+                        log_depth=log_depth, inv_log_far=inv_log_far)
 
     # Transparent pass: back-to-front, z-tested against the opaque depth but not
-    # writing depth, alpha-blended over the existing colour.
+    # writing depth, alpha-blended over the existing colour. The back-to-front
+    # order is required for correct blending and is kept regardless of
+    # `sort_objects`.
     if !isempty(transparent)
         sort!(transparent, by = m -> _mesh_view_depth(m, view))   # farthest first
         stamp = zeros(Int, H, W)          # ensures each pixel blends ≤ once per mesh
@@ -296,15 +515,37 @@ function render!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
             α = material_opacity(mesh.material)
             _rasterize_geo_flat!(rt, mesh.geometry, compute_world_matrix(mesh), mesh.material,
                                  lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
-                                 alpha=α, stamp=stamp, stamp_id=sid, shadow_fn=shadow_fn)
+                                 alpha=α, stamp=stamp, stamp_id=sid, shadow_fn=shadow_fn,
+                                 clipping_planes=clipping_planes,
+                                 xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi,
+                                 log_depth=log_depth, inv_log_far=inv_log_far)
         end
     end
+
+    # Camera-facing sprites (billboards), depth-tested against the mesh passes.
+    render_sprites!(rt, scene, camera; clipping_planes=clipping_planes)
 
     # Line and point primitives (depth-tested against the mesh passes).
     render_lines!(rt, scene, camera)
     render_points!(rt, scene, camera)
 
     return rt
+end
+
+# World-space bounding sphere of a geometry placed by `world_mat`, then tested
+# against the frustum. The sphere centre is the geometry centre transformed to
+# world; the radius scales by the largest axis scale extracted from `world_mat`
+# (a conservative bound for non-uniform scale that never culls a visible mesh).
+@inline function _mesh_in_frustum(frustum::Frustum, geo, world_mat::Mat4)
+    bs = compute_bounding_sphere(geo)
+    bs.radius == 0 && geo.n_vertices == 0 && return false
+    center = mat4_transform_point(world_mat, bs.center)
+    # Column lengths of the upper-left 3×3 give the per-axis scale factors.
+    cx = sqrt(mat4_get(world_mat,1,1)^2 + mat4_get(world_mat,2,1)^2 + mat4_get(world_mat,3,1)^2)
+    cy = sqrt(mat4_get(world_mat,1,2)^2 + mat4_get(world_mat,2,2)^2 + mat4_get(world_mat,3,2)^2)
+    cz = sqrt(mat4_get(world_mat,1,3)^2 + mat4_get(world_mat,2,3)^2 + mat4_get(world_mat,3,3)^2)
+    r = bs.radius * max(cx, cy, cz)
+    return frustum_intersects_sphere(frustum, BoundingSphere(center, r))
 end
 
 # Effective shading for a mesh: its override if set, else the renderer default.
@@ -333,7 +574,10 @@ function _rasterize_geo_flat!(rt::RenderTarget, geo, world_mat::Mat4, mat,
                               lights, proj::Mat4, view::Mat4, near, cam_pos::Vec3,
                               tri, clipped, sx, sy, sz;
                               alpha::Real=1.0, stamp=nothing, stamp_id::Int=0, shadow_fn=nothing,
-                              ylo::Int=1, yhi::Int=typemax(Int), colorbuf=nothing)
+                              xlo::Int=1, xhi::Int=typemax(Int),
+                              ylo::Int=1, yhi::Int=typemax(Int), colorbuf=nothing,
+                              clipping_planes=_NO_PLANES,
+                              log_depth::Bool=false, inv_log_far::Float64=1.0)
     W, H = rt.width, rt.height
     modelview = view * world_mat
     face_colors = colorbuf === nothing ?
@@ -343,6 +587,13 @@ function _rasterize_geo_flat!(rt::RenderTarget, geo, world_mat::Mat4, mat,
     side = material_side(mat)
     normal_mat = side === :double ? world_mat : mat4_transpose(mat4_inverse(world_mat))
     has_normals = length(geo.normals) >= geo.n_vertices * 3
+    # Per-fragment clipping needs each clipped vertex's world position. The
+    # near-clipped polygon is in view space with w=1 (affine), so mapping it back
+    # by the inverse view matrix recovers the world position. Computed once per
+    # mesh and only when clipping is active.
+    has_clip = !isempty(clipping_planes)
+    view_inv = has_clip ? mat4_inverse(view) : view
+    wp1 = _ZERO_V3; wp2 = _ZERO_V3; wp3 = _ZERO_V3
     for fi in 1:geo.n_faces
         i1, i2, i3 = get_face(geo, fi)
         v1 = get_vertex(geo, i1); v2 = get_vertex(geo, i2); v3 = get_vertex(geo, i3)
@@ -369,7 +620,10 @@ function _rasterize_geo_flat!(rt::RenderTarget, geo, world_mat::Mat4, mat,
             ndcx = cv.x * invw; ndcy = cv.y * invw; ndcz = cv.z * invw
             sx[k] = (ndcx + 1) * 0.5 * W
             sy[k] = (1 - ndcy) * 0.5 * H
-            sz[k] = ndcz
+            # Default depth is NDC z; with `log_depth` the clip-space w (view
+            # distance) is encoded logarithmically. Both are monotone in distance,
+            # so the z-test direction is unchanged.
+            sz[k] = log_depth ? _encode_log_depth(cv.w, inv_log_far) : ndcz
         end
 
         fc = face_colors[fi]
@@ -377,11 +631,28 @@ function _rasterize_geo_flat!(rt::RenderTarget, geo, world_mat::Mat4, mat,
             if blend
                 _rasterize_tri_blend!(rt, sx[1], sy[1], sz[1],
                                       sx[k], sy[k], sz[k],
-                                      sx[k+1], sy[k+1], sz[k+1], fc, alpha, stamp, stamp_id)
+                                      sx[k+1], sy[k+1], sz[k+1], fc, alpha, stamp, stamp_id;
+                                      xlo=xlo, xhi=xhi, ylo=ylo, yhi=yhi)
+            elseif has_clip
+                cp1 = clipped[1]; cpk = clipped[k]; cpk1 = clipped[k+1]
+                wp1 = mat4_transform_point(view_inv, Vec3(cp1.x, cp1.y, cp1.z))
+                wp2 = mat4_transform_point(view_inv, Vec3(cpk.x, cpk.y, cpk.z))
+                wp3 = mat4_transform_point(view_inv, Vec3(cpk1.x, cpk1.y, cpk1.z))
+                # 1/w of each clip vertex for perspective-correct world interpolation.
+                iw1 = 1.0 / mat4_transform_vec4(proj, cp1).w
+                iw2 = 1.0 / mat4_transform_vec4(proj, cpk).w
+                iw3 = 1.0 / mat4_transform_vec4(proj, cpk1).w
+                _rasterize_tri!(rt, sx[1], sy[1], sz[1],
+                                sx[k], sy[k], sz[k],
+                                sx[k+1], sy[k+1], sz[k+1], fc, ylo, yhi;
+                                xlo=xlo, xhi=xhi,
+                                clipping_planes=clipping_planes, wp1=wp1, wp2=wp2, wp3=wp3,
+                                iw1=iw1, iw2=iw2, iw3=iw3)
             else
                 _rasterize_tri!(rt, sx[1], sy[1], sz[1],
                                 sx[k], sy[k], sz[k],
-                                sx[k+1], sy[k+1], sz[k+1], fc, ylo, yhi)
+                                sx[k+1], sy[k+1], sz[k+1], fc, ylo, yhi;
+                                xlo=xlo, xhi=xhi)
             end
         end
     end
@@ -389,17 +660,20 @@ function _rasterize_geo_flat!(rt::RenderTarget, geo, world_mat::Mat4, mat,
 end
 
 # Alpha-blend a triangle over the existing colour, z-tested but without writing
-# depth (so transparent fragments don't occlude one another).
+# depth (so transparent fragments don't occlude one another). `xlo`/`xhi`/`ylo`/
+# `yhi` clamp the covered pixel box so scissor testing restricts the blend.
 @inline function _rasterize_tri_blend!(rt::RenderTarget, s1x, s1y, z1, s2x, s2y, z2,
-                                       s3x, s3y, z3, fc::Color3, alpha, stamp, stamp_id::Int)
+                                       s3x, s3y, z3, fc::Color3, alpha, stamp, stamp_id::Int;
+                                       xlo::Int=1, xhi::Int=typemax(Int),
+                                       ylo::Int=1, yhi::Int=typemax(Int))
     W, H = rt.width, rt.height
     area = edge_function(s1x, s1y, s2x, s2y, s3x, s3y)
     abs(area) < 1e-10 && return nothing
     inv_area = 1.0 / area
-    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1)
-    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W)
-    min_y = max(floor(Int, min(s1y, s2y, s3y)), 1)
-    max_y = min(ceil(Int, max(s1y, s2y, s3y)), H)
+    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1, xlo)
+    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W, xhi)
+    min_y = max(floor(Int, min(s1y, s2y, s3y)), 1, ylo)
+    max_y = min(ceil(Int, max(s1y, s2y, s3y)), H, yhi)
     ia = 1.0 - alpha
     use_stamp = stamp !== nothing
     @inbounds for py in min_y:max_y

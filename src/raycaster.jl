@@ -35,16 +35,72 @@ mutable struct Raycaster
     ray::Ray{Float64}
     near::Float64
     far::Float64
+    layers::Layers           # only objects sharing a channel are tested (three.js Raycaster.layers)
+    point_threshold::Float64 # world-space pick radius for PointsObject vertices (three.js params.Points.threshold)
+    line_threshold::Float64  # world-space pick radius for Line/LineSegments segments (three.js params.Line.threshold)
 end
-Raycaster(origin::Vec3, dir::Vec3; near=0.0, far=Inf) =
-    Raycaster(Ray(origin, normalize(dir)), near, far)
+Raycaster(origin::Vec3, dir::Vec3; near=0.0, far=Inf,
+          layers::Layers=layers_enable_all!(Layers()),
+          point_threshold=1.0, line_threshold=1.0) =
+    Raycaster(Ray(origin, normalize(dir)), near, far, layers,
+              Float64(point_threshold), Float64(line_threshold))
+
+"""
+Layers mask attached to `obj`. Scene-graph objects need not carry a `layers`
+field; absent one, three.js semantics put every object on channel 0 (mask = 1).
+"""
+object_layers(obj::AbstractObject3D) =
+    hasproperty(obj, :layers) ? getfield(obj, :layers) : Layers()
+
+# Distance from point `p` to the ray, and the ray parameter `t` (in units of the
+# ray direction `d`, which `Raycaster` keeps normalised) at the closest approach.
+# Returns `(t, dist)`; the projection is clamped to `t >= 0` so points behind the
+# origin report their straight-line distance to the origin (three.js behaviour).
+function _ray_point_distance(o::Vec3, d::Vec3, p::Vec3)
+    w = p - o
+    t = dot(w, d)
+    if t < 0
+        return (zero(t), norm(w))
+    end
+    closest = o + d * t
+    return (t, norm(p - closest))
+end
+
+# Shortest distance between the ray (origin `o`, unit dir `d`) and the segment
+# `[a, b]`, plus the ray parameter `t_ray >= 0` at the closest approach on the
+# ray and the point `seg_pt` on the segment. Closed-form minimisation of
+# |o + t*d - (a + s*seg)|^2 over t >= 0, s in [0,1] (cf. three.js
+# `Ray.distanceSqToSegment`), returning the unsquared distance.
+function _ray_segment_distance(o::Vec3, d::Vec3, a::Vec3, b::Vec3)
+    seg = b - a
+    B = dot(d, seg)            # d·seg
+    C = dot(seg, seg)          # seg·seg = |seg|^2 (A = d·d = 1, d is unit)
+    w0 = o - a
+    D = dot(d, w0)             # d·(o-a)
+    E = dot(seg, w0)           # seg·(o-a)
+    denom = C - B * B          # A*C - B^2 with A = 1; >= 0 (Cauchy–Schwarz)
+    if denom > eps(Float64) * (C + one(C))
+        s_seg = (E - B * D) / denom        # = (A*E - B*D)/denom with A = 1
+    else
+        # Ray parallel to the segment: project the origin onto the segment line.
+        s_seg = C > 0 ? E / C : zero(C)
+    end
+    s_seg = clamp(s_seg, zero(s_seg), one(s_seg))
+    # Closest ray parameter for the clamped segment point, kept on the forward ray.
+    seg_pt = a + seg * s_seg
+    t_ray = max(dot(seg_pt - o, d), zero(B))
+    ray_pt = o + d * t_ray
+    return (t_ray, norm(ray_pt - seg_pt), seg_pt)
+end
 
 # Build the world-space ray through normalized device coords (x,y ∈ [-1,1]).
 function _camera_ray(camera::AbstractCamera, ndc_x, ndc_y)
     inv_vp = mat4_inverse(projection_matrix(camera) * view_matrix(camera))
     p_near = mat4_transform_point(inv_vp, Vec3(ndc_x, ndc_y, -1.0))
     p_far  = mat4_transform_point(inv_vp, Vec3(ndc_x, ndc_y, 1.0))
-    Ray(camera.position, normalize(p_far - p_near))
+    # Origin is the unprojected near-plane point; correct for both perspective and
+    # orthographic cameras (parallel ortho rays do not share an apex).
+    Ray(p_near, normalize(p_far - p_near))
 end
 
 """Aim the raycaster through screen NDC `(x,y)` from a camera (three.js `setFromCamera`)."""
@@ -53,17 +109,16 @@ function set_from_camera!(rc::Raycaster, camera::AbstractCamera, ndc_x, ndc_y)
     return rc
 end
 
-"""
-Intersect the ray with every mesh under `root`, returning `Intersection`s
-sorted by distance (nearest first), filtered to `[near, far]`.
-"""
-function raycast(rc::Raycaster, root::AbstractObject3D)
-    hits = Intersection[]
+# Test a single object's own geometry against the ray, appending any hits to
+# `hits`. Layers and visibility are already checked by the caller. Mesh uses the
+# Möller–Trumbore triangle path; PointsObject uses per-vertex pick radius;
+# LineObject/LineSegments use per-segment pick radius. Other object types (Group,
+# Scene, Bone, Sprite, ...) carry no testable geometry and add nothing.
+function _raycast_object!(hits::Vector{Intersection}, rc::Raycaster, obj::AbstractObject3D)
     o = rc.ray.origin; d = rc.ray.direction
-    for mesh in collect_meshes(root)
-        is_visible(mesh) || continue
-        wm = compute_world_matrix(mesh)
-        geo = mesh.geometry
+    if obj isa Mesh
+        wm = compute_world_matrix(obj)
+        geo = obj.geometry
         @inbounds for fi in 1:geo.n_faces
             i1, i2, i3 = get_face(geo, fi)
             a = mat4_transform_point(wm, get_vertex(geo, i1))
@@ -71,8 +126,64 @@ function raycast(rc::Raycaster, root::AbstractObject3D)
             c = mat4_transform_point(wm, get_vertex(geo, i3))
             t = ray_triangle_intersect(o, d, a, b, c)
             if t !== nothing && rc.near <= t <= rc.far
-                push!(hits, Intersection(t, o + d * t, mesh, fi))
+                push!(hits, Intersection(t, o + d * t, obj, fi))
             end
+        end
+    elseif obj isa PointsObject
+        wm = compute_world_matrix(obj)
+        geo = obj.geometry
+        thr = rc.point_threshold
+        @inbounds for vi in 1:geo.n_vertices
+            p = mat4_transform_point(wm, get_vertex(geo, vi))
+            t, dist = _ray_point_distance(o, d, p)
+            if dist < thr && rc.near <= t <= rc.far
+                # Report the point itself as the hit location; face_index = vertex index.
+                push!(hits, Intersection(t, p, obj, vi))
+            end
+        end
+    elseif obj isa LineObject || obj isa LineSegments
+        wm = compute_world_matrix(obj)
+        geo = obj.geometry
+        thr = rc.line_threshold
+        # LineSegments: disjoint pairs (1-2, 3-4, ...). LineObject: a polyline
+        # connecting consecutive vertices (1-2, 2-3, ...), matching three.js.
+        step = obj isa LineSegments ? 2 : 1
+        nv = geo.n_vertices
+        @inbounds for vi in 1:step:(nv - 1)
+            a = mat4_transform_point(wm, get_vertex(geo, vi))
+            b = mat4_transform_point(wm, get_vertex(geo, vi + 1))
+            t, dist, seg_pt = _ray_segment_distance(o, d, a, b)
+            if dist < thr && rc.near <= t <= rc.far
+                # face_index = the segment's start vertex index (three.js index).
+                push!(hits, Intersection(t, seg_pt, obj, vi))
+            end
+        end
+    end
+    return hits
+end
+
+"""
+    raycast(rc, root; recursive=true)
+
+Intersect the ray with `root` and (when `recursive`) every descendant, returning
+`Intersection`s sorted by distance (nearest first) and filtered to `[near, far]`.
+
+Meshes are tested with the Möller–Trumbore triangle path; `PointsObject`
+vertices and `LineObject`/`LineSegments` segments use the raycaster's
+`point_threshold`/`line_threshold` pick radii (three.js `params.Points`/`Line`).
+Objects whose layer mask shares no channel with `rc.layers`, and invisible
+objects, are skipped (their children are still traversed when `recursive`).
+"""
+function raycast(rc::Raycaster, root::AbstractObject3D; recursive::Bool=true)
+    hits = Intersection[]
+    if recursive
+        traverse(root, obj -> begin
+            (is_visible(obj) && layers_test(object_layers(obj), rc.layers)) &&
+                _raycast_object!(hits, rc, obj)
+        end)
+    else
+        if is_visible(root) && layers_test(object_layers(root), rc.layers)
+            _raycast_object!(hits, rc, root)
         end
     end
     sort!(hits, by = h -> h.distance)

@@ -101,15 +101,19 @@ end
 
 """
 Compute numerical (finite difference) gradients for validation.
+
+Uses second-order accurate central differences (O(δ²) error) so that this
+serves as a trustworthy oracle for the automatic-differentiation gradients.
 """
 function numerical_gradient(f, params::Vector{Float64}; δ=1e-5)
     n = length(params)
     grad = zeros(n)
-    f0 = f(params)
     for i in 1:n
         p_plus = copy(params)
+        p_minus = copy(params)
         p_plus[i] += δ
-        grad[i] = (f(p_plus) - f0) / δ
+        p_minus[i] -= δ
+        grad[i] = (f(p_plus) - f(p_minus)) / (2 * δ)
     end
     return grad
 end

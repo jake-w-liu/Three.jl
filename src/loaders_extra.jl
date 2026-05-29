@@ -30,35 +30,75 @@ end
     return v
 end
 
-# Canonical Huffman as (lengths, codes); decoded MSB-first bit by bit.
-function _build_huff(lengths::Vector{Int})
-    maxbits = maximum(lengths)
-    maxbits == 0 && return (lengths, zeros(Int, length(lengths)))
-    blcount = zeros(Int, maxbits + 1)
-    for l in lengths; l > 0 && (blcount[l + 1] += 1); end
-    code = 0; nextcode = zeros(Int, maxbits + 1)
-    for bits in 1:maxbits
-        code = (code + blcount[bits]) << 1
-        nextcode[bits + 1] = code
-    end
-    codes = zeros(Int, length(lengths))
-    for n in 1:length(lengths)
-        l = lengths[n]
-        if l > 0
-            codes[n] = nextcode[l + 1]; nextcode[l + 1] += 1
-        end
-    end
-    return (lengths, codes)
+# Canonical Huffman decode table (RFC 1951). Decoding walks MSB-first one bit at
+# a time, but each length check is O(1) instead of scanning all symbols.
+#
+# Fields, indexed by code length `len` (1..maxbits):
+#   first_code[len]   smallest canonical code of that length
+#   first_index[len]  offset into `symbols` where that length's symbols start
+#   count[len]        number of symbols of that length
+#   symbols           symbol values (0-based) sorted by (length, code), i.e. by
+#                     ascending symbol index within each length — exactly the
+#                     order `_build_huff` assigns consecutive codes, so
+#                     symbol = symbols[first_index[len] + (code - first_code[len])].
+struct _Huff
+    maxbits::Int
+    first_code::Vector{Int}
+    first_index::Vector{Int}
+    count::Vector{Int}
+    symbols::Vector{Int}
 end
 
-function _decode_sym(br::_BitReader, huff)
-    lengths, codes = huff
-    code = 0; len = 0
-    while len <= 15
-        code = (code << 1) | _getbit(br); len += 1
-        @inbounds for n in 1:length(lengths)
-            if lengths[n] == len && codes[n] == code
-                return n - 1
+# Build the canonical-Huffman fast-decode table from per-symbol code lengths.
+# Produces the identical canonical code assignment as the previous (lengths,
+# codes) form: within a length, codes increase in symbol-index order.
+function _build_huff(lengths::Vector{Int})
+    maxbits = isempty(lengths) ? 0 : maximum(lengths)
+    if maxbits == 0
+        return _Huff(0, Int[], Int[], Int[], Int[])
+    end
+    # Count codes per length and derive the first canonical code per length.
+    blcount = zeros(Int, maxbits + 1)        # blcount[len+1] = #codes of length len
+    @inbounds for l in lengths
+        l > 0 && (blcount[l + 1] += 1)
+    end
+    first_code = zeros(Int, maxbits)         # first_code[len]
+    count = zeros(Int, maxbits)              # count[len]
+    code = 0
+    @inbounds for len in 1:maxbits
+        code = (code + blcount[len]) << 1    # matches _build_huff(prev) recurrence
+        first_code[len] = code
+        count[len] = blcount[len + 1]
+    end
+    # `symbols` holds symbol values grouped by length, in ascending symbol order.
+    first_index = zeros(Int, maxbits)        # offset (0-based) into symbols per length
+    acc = 0
+    @inbounds for len in 1:maxbits
+        first_index[len] = acc
+        acc += count[len]
+    end
+    symbols = Vector{Int}(undef, acc)
+    fill_pos = copy(first_index)             # running write cursor per length
+    @inbounds for n in 1:length(lengths)
+        l = lengths[n]
+        if l > 0
+            symbols[fill_pos[l] + 1] = n - 1 # 0-based symbol value
+            fill_pos[l] += 1
+        end
+    end
+    return _Huff(maxbits, first_code, first_index, count, symbols)
+end
+
+# Decode one symbol. O(code length) bit reads with O(1) work per bit.
+@inline function _decode_sym(br::_BitReader, huff::_Huff)
+    code = 0
+    @inbounds for len in 1:huff.maxbits
+        code = (code << 1) | _getbit(br)
+        cnt = huff.count[len]
+        if cnt > 0
+            off = code - huff.first_code[len]
+            if 0 <= off < cnt
+                return huff.symbols[huff.first_index[len] + off + 1]
             end
         end
     end
@@ -313,7 +353,19 @@ function load_obj_groups(path::String)
     end
     nfaces = length(indices) ÷ 3
     geo = BufferGeometry(out_pos, out_nrm, Float64[], indices, out_vi, nfaces)
-    (!have_normals || all(==(0.0), out_nrm)) && compute_vertex_normals!(geo)
+    # Recompute smooth normals when the file had none, or when ANY emitted vertex
+    # normal is zero-length (some faces lacked vn) — otherwise those vertices
+    # keep a degenerate (0,0,0) normal and shade black.
+    needs_recompute = !have_normals
+    if !needs_recompute
+        @inbounds for b in 1:3:length(out_nrm)
+            if out_nrm[b] == 0.0 && out_nrm[b+1] == 0.0 && out_nrm[b+2] == 0.0
+                needs_recompute = true
+                break
+            end
+        end
+    end
+    needs_recompute && compute_vertex_normals!(geo)
     return (geo, face_mtl, materials)
 end
 
@@ -441,13 +493,30 @@ function _gltf_accessor(gltf, buffers, ai::Int)
     count = Int(acc["count"])
     ncomp = _GLTF_COMP_SIZE[acc["type"]]
     ctype = Int(acc["componentType"])     # 5126=float,5125=uint32,5123=ushort,5121=ubyte
+    compbytes = (ctype == 5126 || ctype == 5125) ? 4 :
+                ctype == 5123 ? 2 : ctype == 5121 ? 1 :
+                error("glTF componentType $ctype")
+    stride = Int(get(bv, "byteStride", 0.0))   # 0 (or absent) => tightly packed
     out = Vector{Float64}(undef, count * ncomp)
-    io = IOBuffer(buf); seek(io, offset)
-    for k in 1:count*ncomp
-        out[k] = ctype == 5126 ? Float64(read(io, Float32)) :
-                 ctype == 5125 ? Float64(read(io, UInt32)) :
-                 ctype == 5123 ? Float64(read(io, UInt16)) :
-                 ctype == 5121 ? Float64(read(io, UInt8)) : error("glTF componentType $ctype")
+    io = IOBuffer(buf)
+    read_comp() = ctype == 5126 ? Float64(read(io, Float32)) :
+                  ctype == 5125 ? Float64(read(io, UInt32)) :
+                  ctype == 5123 ? Float64(read(io, UInt16)) :
+                  Float64(read(io, UInt8))
+    if stride == 0 || stride == ncomp * compbytes
+        seek(io, offset)
+        for k in 1:count*ncomp
+            out[k] = read_comp()
+        end
+    else
+        # Interleaved buffer view: seek to each element start before reading.
+        for e in 0:count-1
+            seek(io, offset + e * stride)
+            base = e * ncomp
+            for c in 1:ncomp
+                out[base + c] = read_comp()
+            end
+        end
     end
     return (out, ncomp, count)
 end
@@ -476,17 +545,49 @@ function _gltf_node_matrix(node)
     return T * R * S
 end
 
-"""
-    load_gltf(path) -> Scene
+# Decompose a column-major TRS matrix `M` into (position, rotation::Euler{:XYZ},
+# scale), matching three.js `Matrix4.decompose` + `Euler.setFromRotationMatrix`
+# (order XYZ). Returned components recompose as T*R*S exactly as
+# `compute_local_matrix`.
+function _gltf_decompose(M::Mat4)
+    position = Vec3(mat4_get(M,1,4), mat4_get(M,2,4), mat4_get(M,3,4))
+    # Column vectors of the upper-left 3x3.
+    c1 = Vec3(mat4_get(M,1,1), mat4_get(M,2,1), mat4_get(M,3,1))
+    c2 = Vec3(mat4_get(M,1,2), mat4_get(M,2,2), mat4_get(M,3,2))
+    c3 = Vec3(mat4_get(M,1,3), mat4_get(M,2,3), mat4_get(M,3,3))
+    sx = norm(c1); sy = norm(c2); sz = norm(c3)
+    # Negative determinant means a reflected basis; three.js folds the sign into sx.
+    det = dot(c1, cross(c2, c3))
+    if det < 0
+        sx = -sx
+        c1 = -c1
+    end
+    # Pure-rotation columns (guard against zero scale).
+    isx = sx == 0 ? zero(sx) : one(sx)/sx
+    isy = sy == 0 ? zero(sy) : one(sy)/sy
+    isz = sz == 0 ? zero(sz) : one(sz)/sz
+    r1 = c1 * isx; r2 = c2 * isy; r3 = c3 * isz
+    # R indexed [row, col]: column r1 -> (R11,R21,R31), r2 -> (R12,R22,R32),
+    # r3 -> (R13,R23,R33).
+    R11 = r1.x
+    R12 = r2.x; R22 = r2.y; R32 = r2.z
+    R13 = r3.x; R23 = r3.y; R33 = r3.z
+    _y = asin(clamp(R13, -one(R13), one(R13)))
+    if abs(R13) < 0.9999999
+        _x = atan(-R23, R33)
+        _z = atan(-R12, R11)
+    else
+        _x = atan(R32, R22)
+        _z = zero(R13)
+    end
+    return (position, Euler(_x, _y, _z, :XYZ), Vec3(sx, sy, sz))
+end
 
-Load a glTF 2.0 file (embedded base64 or external buffers) into a `Scene`.
-Supports node transforms, mesh primitives (POSITION, NORMAL, indices) and
-basic PBR metallic-roughness materials. Skinning/morph targets are ignored.
-"""
-function load_gltf(path::String)
-    gltf = _json_parse(read(path, String))
-    dir = dirname(path)
-    buffers = [_gltf_read_buffer(b, dir) for b in gltf["buffers"]]
+# Build a `Scene` from a parsed glTF document and its decoded buffers. Shared by
+# `load_gltf` (text/embedded buffers) and `load_glb` (binary container, where
+# the BIN chunk is supplied as buffer 0). `buffers` must already contain the raw
+# bytes for every buffer referenced by the document.
+function _gltf_build_scene(gltf, buffers)
     scene = Scene()
 
     function build_primitive(prim)
@@ -512,7 +613,10 @@ function load_gltf(path::String)
         node = gltf["nodes"][node_idx + 1]
         grp = Group()
         M = _gltf_node_matrix(node)
-        grp.position = Vec3(mat4_get(M,1,4), mat4_get(M,2,4), mat4_get(M,3,4))   # translation part
+        pos, rot, scl = _gltf_decompose(M)   # full TRS, not just translation
+        grp.position = pos
+        grp.rotation = rot
+        grp.scale = scl
         add!(parent, grp)
         if haskey(node, "mesh")
             mesh_def = gltf["meshes"][Int(node["mesh"]) + 1]
@@ -530,4 +634,82 @@ function load_gltf(path::String)
         add_node!(scene, Int(n))
     end
     return scene
+end
+
+"""
+    load_gltf(path) -> Scene
+
+Load a glTF 2.0 file (embedded base64 or external buffers) into a `Scene`.
+Supports node transforms, mesh primitives (POSITION, NORMAL, indices) and
+basic PBR metallic-roughness materials. Skinning/morph targets are ignored.
+"""
+function load_gltf(path::String)
+    gltf = _json_parse(read(path, String))
+    dir = dirname(path)
+    buffers = [_gltf_read_buffer(b, dir) for b in gltf["buffers"]]
+    return _gltf_build_scene(gltf, buffers)
+end
+
+# Resolve a glTF buffer that may reference the GLB binary chunk. A buffer with no
+# `uri` is the embedded GLB binary buffer (buffer 0 by spec); otherwise behave
+# exactly like `_gltf_read_buffer`.
+function _glb_read_buffer(buf::Dict, dir::String, bin::Vector{UInt8})
+    uri = get(buf, "uri", nothing)
+    if uri === nothing
+        return bin
+    elseif startswith(uri, "data:")
+        return base64_decode(split(uri, ",", limit=2)[2])
+    else
+        return read(joinpath(dir, uri))
+    end
+end
+
+@inline _rd_le32(b, i) = Int(b[i]) | (Int(b[i+1]) << 8) | (Int(b[i+2]) << 16) | (Int(b[i+3]) << 24)
+
+"""
+    load_glb(path) -> Scene
+
+Load a binary glTF (`.glb`) container into a `Scene`. Parses the 12-byte header
+(magic `glTF`, version, total length) and the chunk list, extracts the JSON
+chunk (type `0x4E4F534A`) and the optional binary chunk (type `0x004E4942`),
+then reuses the glTF document logic. A buffer view without a `uri` reads from
+the embedded binary chunk (buffer 0). Mirrors [`load_gltf`](@ref) output.
+"""
+function load_glb(path::String)
+    bytes = read(path)
+    length(bytes) >= 12 || error("GLB file too short")
+    # 12-byte header: magic, version, total length (all little-endian uint32).
+    magic = _rd_le32(bytes, 1)
+    magic == 0x46546C67 || error("not a GLB file (bad magic)")   # 'glTF' little-endian
+    version = _rd_le32(bytes, 5)
+    version == 2 || error("unsupported GLB version $version")
+    total = _rd_le32(bytes, 9)
+    total = min(total, length(bytes))                            # tolerate over-long declared size
+
+    json_bytes = UInt8[]
+    bin_bytes = UInt8[]
+    have_json = false
+    pos = 13                                                     # first chunk header
+    while pos + 8 <= total + 1
+        clen = _rd_le32(bytes, pos)
+        ctype = _rd_le32(bytes, pos + 4)
+        dstart = pos + 8
+        dend = dstart + clen - 1
+        dend <= length(bytes) || error("GLB chunk exceeds file bounds")
+        if ctype == 0x4E4F534A          # 'JSON'
+            json_bytes = bytes[dstart:dend]
+            have_json = true
+        elseif ctype == 0x004E4942      # 'BIN\0'
+            bin_bytes = bytes[dstart:dend]
+        end
+        # Chunks are 4-byte aligned; advance over any padding to the next header.
+        pad = (4 - (clen % 4)) % 4
+        pos = dend + 1 + pad
+    end
+    have_json || error("GLB has no JSON chunk")
+
+    gltf = _json_parse(String(json_bytes))
+    dir = dirname(path)
+    buffers = [_glb_read_buffer(b, dir, bin_bytes) for b in gltf["buffers"]]
+    return _gltf_build_scene(gltf, buffers)
 end

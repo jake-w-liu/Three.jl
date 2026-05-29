@@ -16,15 +16,53 @@ mutable struct BufferGeometry
     n_vertices::Int
     n_faces::Int
     attributes::Dict{Symbol, BufferAttribute}   # generic named attributes (e.g. :color, :tangent)
-end
+    # Draw groups (three.js BufferGeometry.groups): each tuple is
+    # (start, count, material_index) where `start` is the 1-based index of the
+    # FIRST face in the group, `count` is the number of consecutive faces, and
+    # `material_index` is the 0-based material slot (matching three.js
+    # `materialIndex`). Empty means a single material covers the whole geometry.
+    # NOTE: three.js measures start/count in index-buffer entries; here they are
+    # expressed in faces (triangles), which is this engine's natural draw unit.
+    groups::Vector{NTuple{3,Int}}
 
-# Back-compatible constructor: position/normal/uv/index core, empty named attributes.
-BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces) =
-    BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces,
-                   Dict{Symbol, BufferAttribute}())
+    # Inner constructors keep every existing positional/0-arg/6-arg call working
+    # by defaulting `attributes` and `groups`. The field is added LAST so prior
+    # callers that pass 6 or 7 positional arguments are unaffected.
+    BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces) =
+        new(positions, normals, uvs, indices, n_vertices, n_faces,
+            Dict{Symbol, BufferAttribute}(), NTuple{3,Int}[])
+
+    BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces, attributes) =
+        new(positions, normals, uvs, indices, n_vertices, n_faces,
+            attributes, NTuple{3,Int}[])
+
+    BufferGeometry(positions, normals, uvs, indices, n_vertices, n_faces, attributes, groups) =
+        new(positions, normals, uvs, indices, n_vertices, n_faces, attributes, groups)
+end
 
 function BufferGeometry()
     BufferGeometry(Float64[], Float64[], Float64[], Int[], 0, 0)
+end
+
+"""
+    add_group!(geo, start, count, material_index)
+
+Append a draw group to `geo` (three.js `BufferGeometry.addGroup`). `start` is the
+1-based index of the first face, `count` the number of consecutive faces, and
+`material_index` the 0-based material slot. Returns `geo`.
+"""
+function add_group!(g::BufferGeometry, start::Integer, count::Integer, material_index::Integer)
+    push!(g.groups, (Int(start), Int(count), Int(material_index)))
+    return g
+end
+
+"""Draw groups of `geo` as `(start, count, material_index)` tuples (three.js `BufferGeometry.groups`)."""
+get_groups(g::BufferGeometry) = g.groups
+
+"""Remove all draw groups (three.js `BufferGeometry.clearGroups`)."""
+function clear_groups!(g::BufferGeometry)
+    empty!(g.groups)
+    return g
 end
 
 """Attach a generic named vertex attribute (three.js `setAttribute`)."""
@@ -264,6 +302,7 @@ function CylinderGeometry(; radius_top=1.0, radius_bottom=1.0, height=1.0,
     # Caps
     if !open_ended
         for (cap_y, cap_r, cap_ny) in [(half_h, radius_top, 1.0), (-half_h, radius_bottom, -1.0)]
+            cap_r > 0 || continue   # skip degenerate zero-radius cap (e.g. cone apex)
             center_idx = vi + 1
             append!(positions, [0.0, cap_y, 0.0])
             append!(normals_arr, [0.0, cap_ny, 0.0])
@@ -286,9 +325,9 @@ function CylinderGeometry(; radius_top=1.0, radius_bottom=1.0, height=1.0,
                 curr = center_idx + 1 + x_seg
                 next_v = curr + 1
                 if cap_ny > 0
-                    append!(indices, [center_idx, next_v, curr])
-                else
                     append!(indices, [center_idx, curr, next_v])
+                else
+                    append!(indices, [center_idx, next_v, curr])
                 end
             end
         end
@@ -488,39 +527,22 @@ end
 function IcosahedronGeometry(; radius=1.0, detail=0)
     t = (1 + sqrt(5)) / 2
 
-    raw_verts = [
-        Vec3(-1,  t,  0), Vec3( 1,  t,  0), Vec3(-1, -t,  0), Vec3( 1, -t,  0),
-        Vec3( 0, -1,  t), Vec3( 0,  1,  t), Vec3( 0, -1, -t), Vec3( 0,  1, -t),
-        Vec3( t,  0, -1), Vec3( t,  0,  1), Vec3(-t,  0, -1), Vec3(-t,  0,  1)
+    # Base vertices (un-normalized): PolyhedronGeometry projects each to the sphere.
+    base_verts = [
+        Vec3(-1.0,  t,  0.0), Vec3( 1.0,  t,  0.0), Vec3(-1.0, -t,  0.0), Vec3( 1.0, -t,  0.0),
+        Vec3( 0.0, -1.0,  t), Vec3( 0.0,  1.0,  t), Vec3( 0.0, -1.0, -t), Vec3( 0.0,  1.0, -t),
+        Vec3( t,  0.0, -1.0), Vec3( t,  0.0,  1.0), Vec3(-t,  0.0, -1.0), Vec3(-t,  0.0,  1.0)
     ]
-    raw_verts = [normalize(v) * radius for v in raw_verts]
 
-    raw_faces = [
+    # 20 base faces (1-based vertex indices into base_verts).
+    base_faces = NTuple{3,Int}[
         (1,12,6), (1,6,2), (1,2,8), (1,8,11), (1,11,12),
         (2,6,10), (6,12,5), (12,11,3), (11,8,7), (8,2,9),
         (4,10,5), (4,5,3), (4,3,7), (4,7,9), (4,9,10),
         (10,6,5), (5,12,3), (3,11,7), (7,8,9), (9,2,10)
     ]
 
-    positions = Float64[]
-    normals_arr = Float64[]
-    uvs_arr = Float64[]
-    indices_arr = Int[]
-
-    for (idx, v) in enumerate(raw_verts)
-        append!(positions, [v.x, v.y, v.z])
-        n = normalize(v)
-        append!(normals_arr, [n.x, n.y, n.z])
-        append!(uvs_arr, [0.0, 0.0])
-    end
-
-    for (i1, i2, i3) in raw_faces
-        append!(indices_arr, [i1, i2, i3])
-    end
-
-    n_verts = length(raw_verts)
-    n_faces = length(raw_faces)
-    BufferGeometry(positions, normals_arr, uvs_arr, indices_arr, n_verts, n_faces)
+    PolyhedronGeometry(base_verts, base_faces; radius=radius, detail=detail)
 end
 
 # ========================== Utility ==========================
@@ -529,8 +551,18 @@ function count_triangles(g::BufferGeometry)
     g.n_faces
 end
 
-"""Merge multiple BufferGeometry objects into one (for batching)."""
-function merge_geometries(geos::Vector{BufferGeometry})
+"""
+    merge_geometries(geos; with_groups=true)
+
+Merge multiple `BufferGeometry` objects into one (for batching). The merged
+positions/normals/uvs/indices and carried-over named attributes are identical to
+the previous behaviour. When `with_groups=true` (default), a draw group is
+appended per input geometry recording which faces came from which sub-mesh:
+`(start, count, material_index)` with 1-based `start`, `count` equal to that
+input's face count, and `material_index` equal to its 0-based position in `geos`.
+Inputs that contribute no faces are skipped so empty groups are not emitted.
+"""
+function merge_geometries(geos::Vector{BufferGeometry}; with_groups::Bool=true)
     positions = Float64[]
     normals_arr = Float64[]
     uvs_arr = Float64[]
@@ -538,18 +570,42 @@ function merge_geometries(geos::Vector{BufferGeometry})
     offset = 0
     total_verts = 0
     total_faces = 0
+    groups = NTuple{3,Int}[]
 
-    for g in geos
+    for (mat_idx, g) in enumerate(geos)
         append!(positions, g.positions)
         append!(normals_arr, g.normals)
         append!(uvs_arr, g.uvs)
         for idx in g.indices
             push!(indices, idx + offset)
         end
+        if with_groups && g.n_faces > 0
+            # mat_idx is 1-based; material_index is 0-based (three.js convention).
+            push!(groups, (total_faces + 1, g.n_faces, mat_idx - 1))
+        end
         offset += g.n_vertices
         total_verts += g.n_vertices
         total_faces += g.n_faces
     end
 
-    BufferGeometry(positions, normals_arr, uvs_arr, indices, total_verts, total_faces)
+    merged = BufferGeometry(positions, normals_arr, uvs_arr, indices, total_verts, total_faces)
+    if with_groups
+        append!(merged.groups, groups)
+    end
+
+    # Carry over named attributes present on every input with matching item_size.
+    if !isempty(geos)
+        for (name, attr) in geos[1].attributes
+            keep = all(g -> has_attribute(g, name) &&
+                            get_attribute(g, name).item_size == attr.item_size, geos)
+            keep || continue
+            data = similar(attr.data, 0)
+            for g in geos
+                append!(data, get_attribute(g, name).data)
+            end
+            set_attribute!(merged, name, data, attr.item_size)
+        end
+    end
+
+    return merged
 end

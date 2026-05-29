@@ -14,11 +14,13 @@ struct MeshBasicMaterial <: AbstractMaterial
     wireframe::Bool
     side::Symbol  # :front, :back, :double
     map::Any      # optional albedo Texture
+    vertex_colors::Bool   # modulate by geometry :color attribute when true
 end
 
 function MeshBasicMaterial(; color=Color3(1.0, 1.0, 1.0), opacity=1.0,
-                            transparent=false, wireframe=false, side=:front, map=nothing)
-    MeshBasicMaterial(color, opacity, transparent, wireframe, side, map)
+                            transparent=false, wireframe=false, side=:front, map=nothing,
+                            vertex_colors=false)
+    MeshBasicMaterial(color, opacity, transparent, wireframe, side, map, vertex_colors)
 end
 
 # ========================== MeshLambertMaterial ==========================
@@ -33,13 +35,17 @@ struct MeshLambertMaterial <: AbstractMaterial
     map::Any
     ao_map::Any
     emissive_map::Any
+    vertex_colors::Bool   # modulate by geometry :color attribute when true
+    light_map::Any        # baked indirect-lighting texture (multiplied in, like aoMap)
 end
 
 function MeshLambertMaterial(; color=Color3(1.0, 1.0, 1.0),
                               emissive=Color3(0.0, 0.0, 0.0),
                               opacity=1.0, transparent=false, side=:front,
-                              map=nothing, ao_map=nothing, emissive_map=nothing)
-    MeshLambertMaterial(color, emissive, opacity, transparent, side, map, ao_map, emissive_map)
+                              map=nothing, ao_map=nothing, emissive_map=nothing,
+                              vertex_colors=false, light_map=nothing)
+    MeshLambertMaterial(color, emissive, opacity, transparent, side, map, ao_map, emissive_map,
+                        vertex_colors, light_map)
 end
 
 # ========================== MeshPhongMaterial ==========================
@@ -54,14 +60,16 @@ struct MeshPhongMaterial <: AbstractMaterial
     transparent::Bool
     side::Symbol
     map::Any
+    light_map::Any        # baked indirect-lighting texture (multiplied in, like aoMap)
 end
 
 function MeshPhongMaterial(; color=Color3(1.0, 1.0, 1.0),
                             specular=Color3(0.066, 0.066, 0.066),
                             emissive=Color3(0.0, 0.0, 0.0),
                             shininess=30.0, opacity=1.0,
-                            transparent=false, side=:front, map=nothing)
-    MeshPhongMaterial(color, specular, emissive, shininess, opacity, transparent, side, map)
+                            transparent=false, side=:front, map=nothing, light_map=nothing)
+    MeshPhongMaterial(color, specular, emissive, shininess, opacity, transparent, side, map,
+                      light_map)
 end
 
 # ========================== MeshStandardMaterial ==========================
@@ -80,6 +88,9 @@ struct MeshStandardMaterial <: AbstractMaterial
     roughness_map::Any
     ao_map::Any
     emissive_map::Any
+    vertex_colors::Bool   # modulate by geometry :color attribute when true
+    envmap::Any           # optional CubeTexture for reflection (IBL specular)
+    light_map::Any        # baked indirect-lighting texture (multiplied in, like aoMap)
 end
 
 function MeshStandardMaterial(; color=Color3(1.0, 1.0, 1.0),
@@ -87,9 +98,11 @@ function MeshStandardMaterial(; color=Color3(1.0, 1.0, 1.0),
                                metalness=0.0, roughness=1.0,
                                opacity=1.0, transparent=false, side=:front,
                                map=nothing, normal_map=nothing, roughness_map=nothing,
-                               ao_map=nothing, emissive_map=nothing)
+                               ao_map=nothing, emissive_map=nothing,
+                               vertex_colors=false, envmap=nothing, light_map=nothing)
     MeshStandardMaterial(color, emissive, metalness, roughness, opacity, transparent, side,
-                         map, normal_map, roughness_map, ao_map, emissive_map)
+                         map, normal_map, roughness_map, ao_map, emissive_map,
+                         vertex_colors, envmap, light_map)
 end
 
 # ========================== MeshNormalMaterial ==========================
@@ -144,14 +157,28 @@ struct MeshPhysicalMaterial <: AbstractMaterial
     opacity::Float64
     transparent::Bool
     side::Symbol
+    envmap::Any           # optional CubeTexture for reflection (IBL specular)
+    # --- three.js MeshPhysicalMaterial extensions (added last, keyword defaults) ---
+    sheen::Float64                 # retroreflective sheen strength (0 = off)
+    sheen_color::Color3{Float64}   # tint of the sheen lobe
+    sheen_roughness::Float64       # Charlie-distribution roughness (1 = broad)
+    iridescence::Float64           # thin-film interference blend (0 = off)
+    iridescence_ior::Float64       # refractive index of the thin film
+    iridescence_thickness::Float64 # film thickness in nanometres
+    light_map::Any                 # baked indirect-lighting texture (multiplied in)
 end
 
 function MeshPhysicalMaterial(; color=Color3(1.0,1.0,1.0), emissive=Color3(0.0,0.0,0.0),
                                metalness=0.0, roughness=1.0, clearcoat=0.0,
                                clearcoat_roughness=0.0, transmission=0.0, ior=1.5,
-                               opacity=1.0, transparent=false, side=:front)
+                               opacity=1.0, transparent=false, side=:front, envmap=nothing,
+                               sheen=0.0, sheen_color=Color3(1.0,1.0,1.0), sheen_roughness=1.0,
+                               iridescence=0.0, iridescence_ior=1.3, iridescence_thickness=400.0,
+                               light_map=nothing)
     MeshPhysicalMaterial(color, emissive, metalness, roughness, clearcoat,
-                         clearcoat_roughness, transmission, ior, opacity, transparent, side)
+                         clearcoat_roughness, transmission, ior, opacity, transparent, side,
+                         envmap, sheen, sheen_color, sheen_roughness,
+                         iridescence, iridescence_ior, iridescence_thickness, light_map)
 end
 
 # ========================== MeshToonMaterial ==========================

@@ -8,7 +8,13 @@ struct ShadowMap
     depth::Matrix{Float64}      # NDC depth from the light (smaller = nearer light); Inf = empty
     light_vp::Mat4{Float64}     # light view-projection
     bias::Float64
+    pcf_radius::Int             # percentage-closer-filtering radius r; 0 = hard shadow
 end
+
+# Backward-compatible constructor: existing 3-arg callers get a hard shadow (r=0),
+# matching the original single-sample depth comparison byte-for-byte.
+ShadowMap(depth::Matrix{Float64}, light_vp::Mat4{Float64}, bias::Float64) =
+    ShadowMap(depth, light_vp, bias, 0)
 
 # World-space bounding sphere of all meshes under the scene.
 function _scene_bounds(meshes)
@@ -73,11 +79,17 @@ end
 end
 
 """
-    compute_shadow_map(scene, light; resolution=512, bias=3e-3)
+    compute_shadow_map(scene, light; resolution=512, bias=3e-3, pcf_radius=0)
 
 Render the scene's depth from `light`'s viewpoint into a [`ShadowMap`].
+
+`pcf_radius` selects percentage-closer filtering (PCF) soft shadows when querying
+the map with [`shadow_visibility`](@ref): a value `r` samples a `(2r+1)x(2r+1)`
+neighbourhood of the depth map and returns the lit fraction in `[0,1]`. The
+default `pcf_radius=0` reproduces the original single-sample hard shadow exactly.
 """
-function compute_shadow_map(scene, light; resolution::Int=512, bias=3e-3)
+function compute_shadow_map(scene, light; resolution::Int=512, bias=3e-3, pcf_radius::Int=0)
+    pcf_radius >= 0 || throw(ArgumentError("pcf_radius must be >= 0, got $pcf_radius"))
     meshes = collect_meshes(scene)
     center, radius = _scene_bounds(meshes)
     vp = _light_view_proj(light, center, radius)
@@ -99,13 +111,22 @@ function compute_shadow_map(scene, light; resolution::Int=512, bias=3e-3)
                 (c3.x/c3.w+1)*0.5*W, (1-c3.y/c3.w)*0.5*H, c3.z/c3.w)
         end
     end
-    return ShadowMap(depth, vp, bias)
+    return ShadowMap(depth, vp, bias, pcf_radius)
 end
 
 @inline _vh(v::Vec3) = Vec4(v.x, v.y, v.z, 1.0)
 
-"""Visibility of a world-space point from the shadow map's light: 1 lit, 0 occluded."""
-function shadow_visibility(sm::ShadowMap, p::Vec3)
+"""
+    shadow_visibility(sm, p; pcf_radius=sm.pcf_radius)
+
+Visibility of a world-space point from the shadow map's light: `1` lit, `0`
+fully occluded. With `pcf_radius = r > 0`, a `(2r+1)x(2r+1)` neighbourhood of the
+projected texel is sampled and the lit fraction in `[0,1]` is returned, giving a
+soft penumbra (percentage-closer filtering, matching three.js `PCFShadowMap`).
+The neighbourhood is clamped to the map bounds. `pcf_radius=0` reproduces the
+single-sample hard shadow exactly.
+"""
+function shadow_visibility(sm::ShadowMap, p::Vec3; pcf_radius::Int=sm.pcf_radius)
     c = mat4_transform_vec4(sm.light_vp, _vh(p))
     c.w <= 1e-6 && return 1.0
     ndcx = c.x / c.w; ndcy = c.y / c.w; ndcz = c.z / c.w
@@ -113,17 +134,42 @@ function shadow_visibility(sm::ShadowMap, p::Vec3)
     H, W = size(sm.depth)
     px = clamp(floor(Int, (ndcx + 1) * 0.5 * W) + 1, 1, W)
     py = clamp(floor(Int, (1 - ndcy) * 0.5 * H) + 1, 1, H)
-    d = sm.depth[py, px]
-    isinf(d) && return 1.0
-    return ndcz - sm.bias > d ? 0.0 : 1.0                   # something nearer the light occludes
+
+    r = pcf_radius
+    if r <= 0                                               # hard shadow: single sample
+        d = sm.depth[py, px]
+        isinf(d) && return 1.0
+        return ndcz - sm.bias > d ? 0.0 : 1.0               # something nearer the light occludes
+    end
+
+    # Soft shadow: average the unoccluded fraction over the texel neighbourhood,
+    # clamped to the map bounds. Empty (Inf) texels count as lit, matching the
+    # single-sample early-out above.
+    x0 = max(px - r, 1); x1 = min(px + r, W)
+    y0 = max(py - r, 1); y1 = min(py + r, H)
+    lit = 0
+    total = 0
+    thresh = ndcz - sm.bias
+    @inbounds for sy in y0:y1, sx in x0:x1
+        total += 1
+        d = sm.depth[sy, sx]
+        if isinf(d) || thresh <= d
+            lit += 1
+        end
+    end
+    total == 0 && return 1.0
+    return lit / total
 end
 
 # Build shadow maps for all shadow-casting lights and a closure to query them.
-function _build_shadow_query(scene, lights; resolution::Int=512)
+# `pcf_radius=0` keeps the original hard-shadow behaviour; a positive radius bakes
+# percentage-closer soft shadows into every map, so the query closure returns the
+# lit fraction in [0,1] via the radius stored on each `ShadowMap`.
+function _build_shadow_query(scene, lights; resolution::Int=512, pcf_radius::Int=0)
     maps = IdDict{AbstractLight, ShadowMap}()
     for light in lights
         if !_is_fill_light(light) && hasfield(typeof(light), :cast_shadow) && getfield(light, :cast_shadow)
-            maps[light] = compute_shadow_map(scene, light; resolution=resolution)
+            maps[light] = compute_shadow_map(scene, light; resolution=resolution, pcf_radius=pcf_radius)
         end
     end
     isempty(maps) && return nothing

@@ -16,7 +16,7 @@ Return a closure `p -> image` where `p` is a flat vector of vertex positions
 `[x1,y1,z1, x2,...]`. Differentiable w.r.t. `p` (vertex-position gradients).
 """
 function vertex_render_fn(faces, face_colors, vp::Mat4, W::Int, H::Int;
-                          sigma=1.0, gamma=1e-2, bg=Color3(0.0,0.0,0.0))
+                          sigma=1.0, gamma=1.0, bg=Color3(0.0,0.0,0.0))
     return function (p)
         T = eltype(p)
         nv = length(p) ÷ 3
@@ -36,7 +36,7 @@ Return a closure `p -> image` where `p` is a flat vector of per-face RGB colors
 field over the surface).
 """
 function color_render_fn(vertices, faces, vp::Mat4, W::Int, H::Int;
-                         sigma=1.0, gamma=1e-2, bg=Color3(0.0,0.0,0.0))
+                         sigma=1.0, gamma=1.0, bg=Color3(0.0,0.0,0.0))
     return function (p)
         T = eltype(p)
         nf = length(p) ÷ 3
@@ -56,7 +56,7 @@ Adam optimization of a flat vertex-position vector to match `target`. Returns
 """
 function optimize_vertices(initial::Vector{Float64}, faces, face_colors, vp::Mat4,
                            target::Array{Float64,3}; W::Int, H::Int,
-                           sigma=1.0, gamma=1e-2, lr=0.05, n_iters=50, verbose=false)
+                           sigma=1.0, gamma=1.0, lr=0.05, n_iters=50, verbose=false)
     rf = vertex_render_fn(faces, face_colors, vp, W, H; sigma=sigma, gamma=gamma)
     inverse_render_adam(initial, target, rf, loss_mse; lr=lr, n_iters=n_iters, verbose=verbose)
 end
@@ -69,7 +69,7 @@ differentiable-texture demo. Returns `(optimized_params, loss_history)`.
 """
 function optimize_face_colors(initial::Vector{Float64}, vertices, faces, vp::Mat4,
                               target::Array{Float64,3}; W::Int, H::Int,
-                              sigma=1.0, gamma=1e-2, lr=0.05, n_iters=50, verbose=false)
+                              sigma=1.0, gamma=1.0, lr=0.05, n_iters=50, verbose=false)
     rf = color_render_fn(vertices, faces, vp, W, H; sigma=sigma, gamma=gamma)
     inverse_render_adam(initial, target, rf, loss_mse; lr=lr, n_iters=n_iters, verbose=verbose)
 end

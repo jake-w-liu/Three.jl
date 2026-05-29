@@ -186,7 +186,16 @@ end
 
 function mat4_look_at(eye::Vec3, target::Vec3, up::Vec3)
     z = normalize(eye - target)
-    x = normalize(cross(up, z))
+    xc = cross(up, z)
+    if dot(xc, xc) < 1e-12          # up parallel to view dir: perturb z (three.js lookAt)
+        if abs(z.z) > one(z.z) - 1e-4
+            z = normalize(Vec3(z.x + 1e-4, z.y, z.z))
+        else
+            z = normalize(Vec3(z.x, z.y, z.z + 1e-4))
+        end
+        xc = cross(up, z)
+    end
+    x = normalize(xc)
     y = cross(z, x)
     T = typeof(x.x)
     Mat4{T}((x.x, y.x, z.x, zero(T),
@@ -236,6 +245,10 @@ function mat4_inverse(m::Mat4)
     b11 = a22*a33 - a23*a32
 
     det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06
+    if iszero(det)                  # singular matrix: return zero matrix (three.js Matrix4.invert)
+        T = eltype(e)
+        return Mat4{T}(ntuple(_ -> zero(T), 16))
+    end
     inv_det = one(det) / det
 
     Mat4(( (a11*b11 - a12*b10 + a13*b09)*inv_det,
@@ -468,6 +481,10 @@ function triangle_barycentric(tri::Triangle, p::Vec3)
     d00 = dot(v0, v0); d01 = dot(v0, v1); d11 = dot(v1, v1)
     d20 = dot(v2, v0); d21 = dot(v2, v1)
     denom = d00*d11 - d01*d01
+    if iszero(denom)                # degenerate (collinear/zero-area) triangle (three.js getBarycoord)
+        z = zero(denom)
+        return Vec3(z, z, z)
+    end
     v = (d11*d20 - d01*d21) / denom
     w = (d00*d21 - d01*d20) / denom
     Vec3(one(v) - v - w, v, w)

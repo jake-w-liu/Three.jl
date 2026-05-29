@@ -46,19 +46,20 @@ Structural Similarity Index (SSIM) loss.
 Returns 1 - SSIM (so that minimizing this maximizes SSIM).
 Simplified single-channel average SSIM.
 """
-function loss_ssim(image::Array{T, 3}, target::Array{T, 3};
-                   window_size=7, C1=0.01^2, C2=0.03^2) where T
+function loss_ssim(image::Array{T, 3}, target::Array{S, 3};
+                   window_size=7, C1=0.01^2, C2=0.03^2) where {T, S}
+    R = promote_type(T, S)
     H, W, C = size(image)
     hw = window_size ÷ 2
-    ssim_sum = zero(T)
+    ssim_sum = zero(R)
     count = 0
 
     for c in 1:C
         for j in (hw+1):(W-hw)
             for i in (hw+1):(H-hw)
                 # Local means
-                μx = zero(T)
-                μy = zero(T)
+                μx = zero(R)
+                μy = zero(R)
                 n = 0
                 for dj in -hw:hw
                     for di in -hw:hw
@@ -71,9 +72,9 @@ function loss_ssim(image::Array{T, 3}, target::Array{T, 3};
                 μy /= n
 
                 # Local variances and covariance
-                σx2 = zero(T)
-                σy2 = zero(T)
-                σxy = zero(T)
+                σx2 = zero(R)
+                σy2 = zero(R)
+                σxy = zero(R)
                 for dj in -hw:hw
                     for di in -hw:hw
                         dx = image[i+di, j+dj, c] - μx
@@ -95,8 +96,8 @@ function loss_ssim(image::Array{T, 3}, target::Array{T, 3};
         end
     end
 
-    mean_ssim = count > 0 ? ssim_sum / count : one(T)
-    return one(T) - mean_ssim
+    mean_ssim = count > 0 ? ssim_sum / count : one(R)
+    return one(R) - mean_ssim
 end
 
 """
@@ -104,13 +105,14 @@ Silhouette IoU loss (Intersection over Union).
 Compares binary silhouettes extracted from images.
 `threshold` separates foreground from background.
 """
-function loss_silhouette_iou(image::Array{T, 3}, target::Array{T, 3};
-                              threshold=0.01) where T
+function loss_silhouette_iou(image::Array{T, 3}, target::Array{S, 3};
+                              threshold=0.01) where {T, S}
+    R = promote_type(T, S)
     H, W, _ = size(image)
 
     # Convert to grayscale silhouettes via soft thresholding
-    intersection = zero(T)
-    union_val = zero(T)
+    intersection = zero(R)
+    union_val = zero(R)
 
     for j in 1:W
         for i in 1:H
@@ -127,6 +129,6 @@ function loss_silhouette_iou(image::Array{T, 3}, target::Array{T, 3};
         end
     end
 
-    iou = intersection / max(union_val, T(1e-8))
-    return one(T) - iou
+    iou = intersection / max(union_val, R(1e-8))
+    return one(R) - iou
 end

@@ -200,6 +200,110 @@ function render_lines!(rt::RenderTarget, scene::AbstractObject3D, camera::Abstra
     return rt
 end
 
+# ========================== Sprite rasterization ==========================
+
+# Camera-facing quad corner: project local (lx,ly) on the sprite plane through
+# the sprite's screen-aligned world matrix, returning screen x/y, ndc z, 1/w and
+# the world position (for clipping). `ok=false` if behind the near plane.
+@inline function _sprite_corner(M::Mat4, vp::Mat4, lx, ly, W, H)
+    wp = mat4_transform_point(M, Vec3(lx, ly, 0.0))
+    c = mat4_transform_vec4(vp, Vec4(wp.x, wp.y, wp.z, 1.0))
+    c.w <= 1e-6 && return (0.0, 0.0, 0.0, 0.0, wp, false)
+    iw = 1.0 / c.w
+    ((c.x*iw + 1)*0.5*W, (1 - c.y*iw)*0.5*H, c.z*iw, iw, wp, true)
+end
+
+# Rasterize one sprite quad triangle with z-test, optional albedo texture
+# (perspective-correct UV), tint colour, and world-space clipping planes.
+@inline function _rasterize_sprite_tri!(rt::RenderTarget,
+        s1x, s1y, z1, iw1, u1, v1, wp1::Vec3,
+        s2x, s2y, z2, iw2, u2, v2, wp2::Vec3,
+        s3x, s3y, z3, iw3, u3, v3, wp3::Vec3,
+        tint::Color3, tex, clipping_planes)
+    W, H = rt.width, rt.height
+    area = edge_function(s1x, s1y, s2x, s2y, s3x, s3y)
+    abs(area) < 1e-10 && return nothing
+    inv_area = 1.0 / area
+    min_x = max(floor(Int, min(s1x, s2x, s3x)), 1)
+    max_x = min(ceil(Int, max(s1x, s2x, s3x)), W)
+    min_y = max(floor(Int, min(s1y, s2y, s3y)), 1)
+    max_y = min(ceil(Int, max(s1y, s2y, s3y)), H)
+    has_tex = tex !== nothing
+    has_clip = !isempty(clipping_planes)
+    @inbounds for py in min_y:max_y
+        for px in min_x:max_x
+            cx = px - 0.5; cy = py - 0.5
+            b0 = edge_function(s2x, s2y, s3x, s3y, cx, cy) * inv_area
+            b1 = edge_function(s3x, s3y, s1x, s1y, cx, cy) * inv_area
+            b2 = edge_function(s1x, s1y, s2x, s2y, cx, cy) * inv_area
+            (b0 >= 0 && b1 >= 0 && b2 >= 0) || continue
+            z = b0 * z1 + b1 * z2 + b2 * z3
+            z < rt.depth[py, px] || continue
+            if has_clip
+                wp = Vec3(b0*wp1.x + b1*wp2.x + b2*wp3.x,
+                          b0*wp1.y + b1*wp2.y + b2*wp3.y,
+                          b0*wp1.z + b1*wp2.z + b2*wp3.z)
+                _clip_keep(clipping_planes, wp) || continue
+            end
+            col = tint
+            if has_tex
+                iw = b0*iw1 + b1*iw2 + b2*iw3
+                a0 = b0*iw1/iw; a1 = b1*iw2/iw; a2 = b2*iw3/iw
+                u = a0*u1 + a1*u2 + a2*u3
+                v = a0*v1 + a1*v2 + a2*v3
+                col = col * sample_texture(tex, u, v)
+            end
+            col = clamp_color(col)
+            rt.depth[py, px] = z
+            rt.color[py, px, 1] = col.r; rt.color[py, px, 2] = col.g; rt.color[py, px, 3] = col.b
+        end
+    end
+    return nothing
+end
+
+"""
+    render_sprites!(rt, scene, camera; clipping_planes=Plane[])
+
+Rasterize every visible [`Sprite`](@ref) under `scene` as a camera-facing
+billboard. Each sprite is a unit quad (corners at local ±0.5) oriented by
+[`sprite_world_matrix`](@ref) so it squarely faces the camera, scaled by the
+sprite's scale, projected, and drawn depth-tested. The sprite material's `map`
+texture (if any) is sampled per pixel and modulated by its `color` tint; without
+a map the flat tint colour is used.
+"""
+function render_sprites!(rt::RenderTarget, scene::AbstractObject3D, camera::AbstractCamera;
+                         clipping_planes=_NO_PLANES)
+    vp = projection_matrix(camera) * view_matrix(camera)
+    W, H = rt.width, rt.height
+    traverse(scene, function(obj)
+        (is_visible(obj) && obj isa Sprite) || return
+        M = sprite_world_matrix(obj, camera)
+        mat = obj.material
+        tint = _material_field(mat, :color)
+        tint === nothing && (tint = Color3(1.0, 1.0, 1.0))
+        tex = _material_field(mat, :map)
+        # Quad corners (local sprite plane) and their UVs (v=0 at the bottom).
+        (s0x, s0y, z0, iw0, wp0, ok0) = _sprite_corner(M, vp, -0.5, -0.5, W, H)
+        (s1x, s1y, z1, iw1, wp1, ok1) = _sprite_corner(M, vp,  0.5, -0.5, W, H)
+        (s2x, s2y, z2, iw2, wp2, ok2) = _sprite_corner(M, vp,  0.5,  0.5, W, H)
+        (s3x, s3y, z3, iw3, wp3, ok3) = _sprite_corner(M, vp, -0.5,  0.5, W, H)
+        (ok0 && ok1 && ok2 && ok3) || return
+        # Triangle (0,1,2): UVs (0,0),(1,0),(1,1).
+        _rasterize_sprite_tri!(rt,
+            s0x, s0y, z0, iw0, 0.0, 0.0, wp0,
+            s1x, s1y, z1, iw1, 1.0, 0.0, wp1,
+            s2x, s2y, z2, iw2, 1.0, 1.0, wp2,
+            tint, tex, clipping_planes)
+        # Triangle (0,2,3): UVs (0,0),(1,1),(0,1).
+        _rasterize_sprite_tri!(rt,
+            s0x, s0y, z0, iw0, 0.0, 0.0, wp0,
+            s2x, s2y, z2, iw2, 1.0, 1.0, wp2,
+            s3x, s3y, z3, iw3, 0.0, 1.0, wp3,
+            tint, tex, clipping_planes)
+    end)
+    return rt
+end
+
 """Rasterize `PointsObject` vertices as small squares sized by the material."""
 function render_points!(rt::RenderTarget, scene::AbstractObject3D, camera::AbstractCamera)
     vp = projection_matrix(camera) * view_matrix(camera)
@@ -252,6 +356,313 @@ reinhard_pass(img) = tone_map_reinhard(img)
 aces_pass(img) = tone_map_aces(img)
 srgb_pass(img) = srgb_encode(img)
 
+# --------------------------------------------------------------------------
+# Additional post-processing passes.
+#
+# Convention: every pass consumed by [`EffectComposer`] is a `Function` that maps
+# an H×W×3 colour image to an H×W×3 image (see `compose`). The colour-only passes
+# below (`bloom_pass`, `fxaa_pass`) match the built-ins exactly; they are factory
+# functions that read keyword parameters and return such a mapping. The passes
+# that need scene depth (`outline_pass`, `ssao_pass`, `bokeh_pass`) capture a
+# depth buffer (the `H×W` `RenderTarget.depth`, smaller = nearer, `Inf` =
+# background) and likewise return an `img -> img` mapping, so they slot into the
+# composer identically. No G-buffer normal channel exists, so the SSAO pass
+# reconstructs view-space normals from the depth gradient (documented below).
+# --------------------------------------------------------------------------
+
+# Rec.601 luma of an RGB pixel at (i,j) — shared by several passes.
+@inline _luma(img, i, j) = @inbounds 0.299*img[i,j,1] + 0.587*img[i,j,2] + 0.114*img[i,j,3]
+
+# Build a 1-D Gaussian kernel of the given integer radius (σ = radius/2, clamped),
+# normalized to sum 1. Returned as an OffsetVector-free plain Vector indexed 1..2r+1
+# (centre at r+1).
+function _gaussian_kernel(radius::Int)
+    r = max(radius, 0)
+    σ = max(r / 2, 1e-3)
+    k = Vector{Float64}(undef, 2r + 1)
+    s = 0.0
+    @inbounds for t in -r:r
+        w = exp(-(t*t) / (2σ*σ)); k[t + r + 1] = w; s += w
+    end
+    inv = 1.0 / s
+    @inbounds for t in eachindex(k); k[t] *= inv; end
+    return k
+end
+
+# Separable Gaussian blur of an H×W×3 image with the given radius. Edges are
+# handled by clamping the sample index (replicate border). Uses one scratch
+# buffer for the horizontal pass, then writes the vertical pass into `out`.
+function _blur_separable(img::AbstractArray, radius::Int)
+    H, W, _ = size(img)
+    r = max(radius, 0)
+    r == 0 && return Float64.(img)
+    k = _gaussian_kernel(r)
+    tmp = Array{Float64}(undef, H, W, 3)
+    out = Array{Float64}(undef, H, W, 3)
+    @inbounds for c in 1:3, i in 1:H, j in 1:W           # horizontal
+        acc = 0.0
+        for t in -r:r
+            jj = clamp(j + t, 1, W)
+            acc += k[t + r + 1] * img[i, jj, c]
+        end
+        tmp[i, j, c] = acc
+    end
+    @inbounds for c in 1:3, i in 1:H, j in 1:W           # vertical
+        acc = 0.0
+        for t in -r:r
+            ii = clamp(i + t, 1, H)
+            acc += k[t + r + 1] * tmp[ii, j, c]
+        end
+        out[i, j, c] = acc
+    end
+    return out
+end
+
+"""
+    bloom_pass(; threshold=0.8, intensity=0.6, radius=2)
+
+Bloom post-process. Extracts a bright-pass image (pixels whose Rec.601 luma
+exceeds `threshold`, keeping their colour), blurs it with a separable Gaussian of
+the given pixel `radius`, and adds the blurred glow back to the original image
+scaled by `intensity`. Returns a new H×W×3 image; the input is not mutated. The
+returned closure matches the [`EffectComposer`] pass convention (`img -> img`).
+"""
+function bloom_pass(; threshold::Real=0.8, intensity::Real=0.6, radius::Int=2)
+    thr = Float64(threshold); inten = Float64(intensity); rad = max(Int(radius), 0)
+    return function (img::AbstractArray)
+        H, W, _ = size(img)
+        bright = Array{Float64}(undef, H, W, 3)        # bright-pass extraction
+        @inbounds for i in 1:H, j in 1:W
+            if _luma(img, i, j) > thr
+                bright[i,j,1] = img[i,j,1]; bright[i,j,2] = img[i,j,2]; bright[i,j,3] = img[i,j,3]
+            else
+                bright[i,j,1] = 0.0; bright[i,j,2] = 0.0; bright[i,j,3] = 0.0
+            end
+        end
+        glow = _blur_separable(bright, rad)
+        out = Array{Float64}(undef, H, W, 3)
+        @inbounds for idx in eachindex(out)
+            out[idx] = img[idx] + inten * glow[idx]
+        end
+        return out
+    end
+end
+
+"""
+    fxaa_pass()
+
+Compact luma-based anti-aliasing (FXAA-style). For each pixel the Rec.601 luma of
+the 4-neighbourhood is measured; where the local luma contrast (max − min)
+exceeds an internal threshold, the pixel is blended toward its neighbours along
+the dominant edge direction (horizontal or vertical, whichever has the larger
+gradient). Colour-only: the depth buffer is not used. Returns a new H×W×3 image.
+The returned closure matches the [`EffectComposer`] pass convention.
+"""
+function fxaa_pass()
+    # Edge thresholds follow the original FXAA quality presets (relative + absolute).
+    EDGE_MIN = 0.0312     # absolute luma floor below which no AA is applied
+    EDGE_REL = 0.125      # contrast must exceed this fraction of the local max luma
+    return function (img::AbstractArray)
+        H, W, _ = size(img)
+        out = Float64.(img)
+        @inbounds for i in 2:H-1, j in 2:W-1
+            lC = _luma(img, i, j)
+            lN = _luma(img, i-1, j); lS = _luma(img, i+1, j)
+            lW = _luma(img, i, j-1); lE = _luma(img, i, j+1)
+            lmax = max(lC, lN, lS, lW, lE)
+            lmin = min(lC, lN, lS, lW, lE)
+            contrast = lmax - lmin
+            (contrast < max(EDGE_MIN, EDGE_REL*lmax)) && continue
+            # Dominant edge direction: vertical gradient vs horizontal gradient.
+            gv = abs(lN - lS); gh = abs(lW - lE)
+            if gv >= gh
+                # Edge is horizontal-ish → blend vertically (with N and S).
+                for c in 1:3
+                    out[i,j,c] = 0.5*img[i,j,c] + 0.25*img[i-1,j,c] + 0.25*img[i+1,j,c]
+                end
+            else
+                # Edge is vertical-ish → blend horizontally (with W and E).
+                for c in 1:3
+                    out[i,j,c] = 0.5*img[i,j,c] + 0.25*img[i,j-1,c] + 0.25*img[i,j+1,c]
+                end
+            end
+        end
+        return out
+    end
+end
+
+"""
+    outline_pass(depth; threshold=0.1, color=Color3(0,0,0))
+
+Edge outlining from the depth buffer. A Sobel gradient magnitude is computed on
+the supplied `depth` matrix (the `H×W` `RenderTarget.depth`; smaller = nearer,
+`Inf` = background). Wherever the normalized depth-gradient magnitude exceeds
+`threshold`, the output pixel is set to `color`; elsewhere the original colour is
+kept. Background/foreground silhouettes (finite↔`Inf` transitions) always count
+as edges. Returns a new H×W×3 image. The returned closure matches the
+[`EffectComposer`] pass convention; the depth buffer is captured here because the
+composer only forwards the colour image.
+
+`depth` defaults to a keyword so the pass can be built standalone, but a depth
+matrix must be supplied for outlines to appear.
+"""
+function outline_pass(depth::AbstractMatrix; threshold::Real=0.1, color::Color3=Color3(0.0,0.0,0.0))
+    thr = Float64(threshold)
+    oc = (Float64(color.r), Float64(color.g), Float64(color.b))
+    # Map a raw depth to a bounded finite value so Sobel differences are well
+    # defined at silhouettes: Inf (background) → a large sentinel beyond any face.
+    @inline function dval(d)
+        isfinite(d) ? Float64(d) : 1.0e9
+    end
+    return function (img::AbstractArray)
+        H, W, _ = size(img)
+        out = Float64.(img)
+        (H >= 3 && W >= 3) || return out
+        # Normalize the gradient by the finite depth range so `threshold` is scale-free.
+        dmin = Inf; dmax = -Inf
+        @inbounds for i in 1:H, j in 1:W
+            d = depth[i,j]
+            if isfinite(d)
+                d < dmin && (dmin = d); d > dmax && (dmax = d)
+            end
+        end
+        span = (isfinite(dmin) && dmax > dmin) ? (dmax - dmin) : 1.0
+        invspan = 1.0 / span
+        @inbounds for i in 2:H-1, j in 2:W-1
+            d11 = dval(depth[i-1,j-1]); d12 = dval(depth[i-1,j]); d13 = dval(depth[i-1,j+1])
+            d21 = dval(depth[i  ,j-1]);                            d23 = dval(depth[i  ,j+1])
+            d31 = dval(depth[i+1,j-1]); d32 = dval(depth[i+1,j]); d33 = dval(depth[i+1,j+1])
+            gx = (d13 + 2*d23 + d33) - (d11 + 2*d21 + d31)
+            gy = (d31 + 2*d32 + d33) - (d11 + 2*d12 + d13)
+            mag = sqrt(gx*gx + gy*gy) * 0.25 * invspan
+            if mag > thr
+                out[i,j,1] = oc[1]; out[i,j,2] = oc[2]; out[i,j,3] = oc[3]
+            end
+        end
+        return out
+    end
+end
+
+"""
+    ssao_pass(depth; radius=1.0, intensity=1.0, samples=8)
+
+Screen-space ambient occlusion derived from the depth buffer alone (no G-buffer
+normal channel exists in this rasterizer). For each foreground pixel the
+view-space normal is reconstructed from the local depth gradient (finite
+differences of `depth`, treated as a height field), then `samples` neighbours are
+probed on the image-plane circle of the given pixel `radius`. A neighbour
+contributes occlusion when it is nearer than the centre by more than a small bias
+and lies in front of the reconstructed surface plane (its depth delta projects
+onto the normal). The accumulated occlusion darkens the pixel by up to
+`intensity`. Background pixels (`Inf` depth) are left unchanged. Returns a new
+H×W×3 image. The returned closure matches the [`EffectComposer`] pass convention;
+the depth buffer is captured here because the composer only forwards colour.
+"""
+function ssao_pass(depth::AbstractMatrix; radius::Real=1.0, intensity::Real=1.0, samples::Int=8)
+    rad = max(Float64(radius), 1e-3)
+    inten = clamp(Float64(intensity), 0.0, 1.0)
+    ns = max(Int(samples), 1)
+    bias = 1e-4
+    # Precompute fixed hemisphere sample offsets on the image-plane circle (in
+    # pixels), distributed by angle with mild radial jitter for coverage. Fixed
+    # (deterministic) so the pass is reproducible.
+    offs = Vector{NTuple{2,Float64}}(undef, ns)
+    @inbounds for s in 1:ns
+        θ = 2π * (s - 1) / ns
+        rr = rad * (0.4 + 0.6 * (s / ns))      # spread samples over the radius
+        offs[s] = (rr*cos(θ), rr*sin(θ))
+    end
+    return function (img::AbstractArray)
+        H, W, _ = size(img)
+        out = Float64.(img)
+        (H >= 3 && W >= 3) || return out
+        @inline df(i, j) = (d = depth[clamp(i,1,H), clamp(j,1,W)]; isfinite(d) ? Float64(d) : NaN)
+        @inbounds for i in 2:H-1, j in 2:W-1
+            dC = depth[i,j]
+            isfinite(dC) || continue
+            dc = Float64(dC)
+            # Reconstruct a view-space normal from the depth height field. The
+            # surface (x=col, y=row, z=depth) has tangents (1,0,dz/dx),(0,1,dz/dy);
+            # their cross product gives (-dz/dx, -dz/dy, 1) (smaller depth = nearer).
+            dzx = df(i, j+1); isnan(dzx) && (dzx = dc); dzx -= dc
+            dzy = df(i+1, j); isnan(dzy) && (dzy = dc); dzy -= dc
+            nx = -dzx; ny = -dzy; nz = 1.0
+            ninv = 1.0 / sqrt(nx*nx + ny*ny + nz*nz)
+            nx *= ninv; ny *= ninv; nz *= ninv
+            occ = 0.0
+            cnt = 0
+            for s in 1:ns
+                (ox, oy) = offs[s]
+                si = i + round(Int, oy); sj = j + round(Int, ox)
+                dN = df(si, sj)
+                isnan(dN) && continue          # background neighbour: no occlusion
+                cnt += 1
+                Δ = dc - dN                    # >0 when neighbour is nearer (occluder)
+                if Δ > bias
+                    # Project the (image-plane offset, depth delta) onto the normal:
+                    # only count occluders sitting above the surface plane.
+                    proj = nx*ox + ny*oy + nz*Δ
+                    if proj > bias
+                        # Range check: distant depth gaps shouldn't over-darken.
+                        rcheck = rad / (rad + Δ)
+                        occ += rcheck
+                    end
+                end
+            end
+            cnt == 0 && continue
+            ao = 1.0 - inten * (occ / cnt)
+            ao = clamp(ao, 0.0, 1.0)
+            out[i,j,1] = img[i,j,1]*ao; out[i,j,2] = img[i,j,2]*ao; out[i,j,3] = img[i,j,3]*ao
+        end
+        return out
+    end
+end
+
+"""
+    bokeh_pass(depth; focus_depth, aperture=0.02)
+
+Depth-of-field (bokeh) blur driven by the depth buffer. Each pixel's circle of
+confusion radius is `|depth - focus_depth| * aperture` (in pixels, rounded and
+capped), so geometry near `focus_depth` stays sharp while out-of-focus regions
+are box-blurred over their circle of confusion. Background pixels (`Inf` depth)
+are treated as maximally defocused at the cap. Returns a new H×W×3 image. The
+returned closure matches the [`EffectComposer`] pass convention; the depth buffer
+is captured here because the composer only forwards the colour image.
+
+`focus_depth` is required (the in-focus depth plane, in the same units as the
+depth buffer). This is a scatter-as-gather approximation: each output pixel
+averages a disc sized by its own circle of confusion. It does not model true lens
+occlusion or partial-occlusion bleeding, which a CPU gather DoF cannot represent
+exactly.
+"""
+function bokeh_pass(; focus_depth::Real, aperture::Real=0.02, depth::AbstractMatrix)
+    fd = Float64(focus_depth); ap = max(Float64(aperture), 0.0)
+    maxr = 16                                  # cap CoC radius to bound work
+    return function (img::AbstractArray)
+        H, W, _ = size(img)
+        out = Array{Float64}(undef, H, W, 3)
+        @inbounds for i in 1:H, j in 1:W
+            dC = depth[i,j]
+            coc = isfinite(dC) ? abs(Float64(dC) - fd) * ap : Float64(maxr)
+            r = min(round(Int, coc), maxr)
+            if r <= 0
+                out[i,j,1] = img[i,j,1]; out[i,j,2] = img[i,j,2]; out[i,j,3] = img[i,j,3]
+                continue
+            end
+            r2 = r * r
+            sr = 0.0; sg = 0.0; sb = 0.0; wsum = 0.0
+            for dy in -r:r, dx in -r:r
+                (dx*dx + dy*dy) <= r2 || continue   # disc-shaped circle of confusion
+                ii = clamp(i + dy, 1, H); jj = clamp(j + dx, 1, W)
+                sr += img[ii,jj,1]; sg += img[ii,jj,2]; sb += img[ii,jj,3]; wsum += 1.0
+            end
+            iw = 1.0 / wsum
+            out[i,j,1] = sr*iw; out[i,j,2] = sg*iw; out[i,j,3] = sb*iw
+        end
+        return out
+    end
+end
+
 # ========================== Tiled / parallel rasterization ==========================
 
 """
@@ -263,6 +674,7 @@ Produces the same image as [`render!`] for opaque flat scenes.
 """
 function render_tiled!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
                        tiles::Int=max(Threads.nthreads(), 1), shading::Symbol=:flat)
+    shading === :flat || throw(ArgumentError("render_tiled! supports only :flat shading"))
     clear!(rt, scene.background)
     proj = projection_matrix(camera)
     view = view_matrix(camera)
@@ -270,6 +682,7 @@ function render_tiled!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
     H = rt.height
     meshes = collect_meshes(scene)
     lights = collect_lights(scene)
+    instanced = collect_instanced(scene)
     band = cld(H, tiles)
     Threads.@threads for t in 1:tiles
         ylo = (t-1)*band + 1
@@ -284,6 +697,15 @@ function render_tiled!(rt::RenderTarget, scene::Scene, camera::AbstractCamera;
             _rasterize_geo_flat!(rt, mesh.geometry, compute_world_matrix(mesh), mesh.material,
                                  lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
                                  ylo=ylo, yhi=yhi)
+        end
+        for im in instanced
+            is_visible(im) || continue
+            base = compute_world_matrix(im)
+            for M in im.instance_matrices
+                _rasterize_geo_flat!(rt, im.geometry, base * M, im.material,
+                                     lights, proj, view, near, camera.position, tri, clipped, sx, sy, sz;
+                                     ylo=ylo, yhi=yhi)
+            end
         end
     end
     return rt

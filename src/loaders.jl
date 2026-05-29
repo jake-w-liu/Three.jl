@@ -182,6 +182,245 @@ function load_obj(path::String)
     end
     nfaces = length(indices) ÷ 3
     geo = BufferGeometry(out_pos, out_nrm, Float64[], indices, out_vi, nfaces)
-    (!have_normals || all(==(0.0), out_nrm)) && compute_vertex_normals!(geo)
+    # Recompute smooth normals when the file had none, or when ANY emitted vertex
+    # normal is zero-length (e.g. a face lacked vn) — otherwise those vertices
+    # keep a degenerate (0,0,0) normal and shade black.
+    needs_recompute = !have_normals
+    if !needs_recompute
+        @inbounds for b in 1:3:length(out_nrm)
+            if out_nrm[b] == 0.0 && out_nrm[b+1] == 0.0 && out_nrm[b+2] == 0.0
+                needs_recompute = true
+                break
+            end
+        end
+    end
+    needs_recompute && compute_vertex_normals!(geo)
+    return geo
+end
+
+# ========================== PLY ==========================
+
+# Size in bytes and an LE reader for each Stanford-PLY scalar type. Type aliases
+# (char/int8, uchar/uint8, short/int16, ushort/uint16, int/int32, uint/uint32,
+# float/float32, double/float64) are normalised to a canonical token.
+const _PLY_TYPE = Dict(
+    "char"=>:i8, "int8"=>:i8, "uchar"=>:u8, "uint8"=>:u8,
+    "short"=>:i16, "int16"=>:i16, "ushort"=>:u16, "uint16"=>:u16,
+    "int"=>:i32, "int32"=>:i32, "uint"=>:u32, "uint32"=>:u32,
+    "float"=>:f32, "float32"=>:f32, "double"=>:f64, "float64"=>:f64,
+)
+const _PLY_SIZE = Dict(:i8=>1, :u8=>1, :i16=>2, :u16=>2, :i32=>4, :u32=>4, :f32=>4, :f64=>8)
+# Integer scalar types: PLY colour channels stored as integers are normalised to [0,1].
+_ply_is_int(t::Symbol) = t in (:i8, :u8, :i16, :u16, :i32, :u32)
+
+# Read one scalar of canonical type `t` from byte vector `b` at 1-based offset
+# `p` (little-endian). Returns (value::Float64, next_offset).
+@inline function _ply_read_le(b::Vector{UInt8}, p::Int, t::Symbol)
+    if t === :u8
+        return (Float64(b[p]), p + 1)
+    elseif t === :i8
+        return (Float64(reinterpret(Int8, b[p])), p + 1)
+    elseif t === :u16
+        v = UInt16(b[p]) | (UInt16(b[p+1]) << 8); return (Float64(v), p + 2)
+    elseif t === :i16
+        v = UInt16(b[p]) | (UInt16(b[p+1]) << 8); return (Float64(reinterpret(Int16, v)), p + 2)
+    elseif t === :u32
+        v = UInt32(b[p]) | (UInt32(b[p+1])<<8) | (UInt32(b[p+2])<<16) | (UInt32(b[p+3])<<24)
+        return (Float64(v), p + 4)
+    elseif t === :i32
+        v = UInt32(b[p]) | (UInt32(b[p+1])<<8) | (UInt32(b[p+2])<<16) | (UInt32(b[p+3])<<24)
+        return (Float64(reinterpret(Int32, v)), p + 4)
+    elseif t === :f32
+        v = UInt32(b[p]) | (UInt32(b[p+1])<<8) | (UInt32(b[p+2])<<16) | (UInt32(b[p+3])<<24)
+        return (Float64(reinterpret(Float32, v)), p + 4)
+    else  # :f64
+        v = UInt64(0)
+        @inbounds for k in 0:7
+            v |= UInt64(b[p+k]) << (8k)
+        end
+        return (reinterpret(Float64, v), p + 8)
+    end
+end
+
+"""
+    load_ply(path) -> BufferGeometry
+
+Load a Stanford `.ply` mesh (ASCII or `binary_little_endian`). Reads the
+`vertex` element (`x,y,z`; optional `nx,ny,nz`; optional `red,green,blue`) and
+the `face` element (a vertex-index list per face, fan-triangulated). Returns a
+[`BufferGeometry`](@ref) with positions, normals (file normals when present,
+otherwise smooth normals via [`compute_vertex_normals!`](@ref)), and a `:color`
+vertex attribute when colours are present (integer channels normalised to
+`[0,1]`).
+"""
+function load_ply(path::String)
+    bytes = read(path)
+    n = length(bytes)
+
+    # --- Parse the (always-ASCII) header line by line over the byte stream. ---
+    # `i` walks the byte offset; after "end_header" it marks the body start.
+    format = :ascii                 # :ascii | :binary_little_endian
+    # Per element, in declared order: name, count, and an ordered property list.
+    # Vertex/scalar properties are stored as (:scalar, name, type). A face list
+    # property is stored as (:list, name, count_type, index_type).
+    elements = Tuple{String,Int,Vector{Any}}[]
+    i = 1
+    function next_line()
+        j = i
+        while j <= n && bytes[j] != UInt8('\n'); j += 1; end
+        e = j - 1
+        e >= i && bytes[e] == UInt8('\r') && (e -= 1)   # strip CRLF
+        line = e >= i ? String(bytes[i:e]) : ""
+        i = j + 1                   # advance past the newline
+        return line
+    end
+
+    magic = next_line()
+    strip(magic) == "ply" || error("not a PLY file")
+    while true
+        i <= n || error("PLY header has no end_header")
+        line = strip(next_line())
+        (isempty(line) || startswith(line, "comment") || startswith(line, "obj_info")) && continue
+        t = split(line)
+        tag = t[1]
+        if tag == "format"
+            fmt = t[2]
+            if fmt == "ascii"
+                format = :ascii
+            elseif fmt == "binary_little_endian"
+                format = :binary_little_endian
+            else
+                error("unsupported PLY format $fmt")
+            end
+        elseif tag == "element"
+            push!(elements, (String(t[2]), parse(Int, t[3]), Any[]))
+        elseif tag == "property"
+            isempty(elements) && error("PLY property before element")
+            props = elements[end][3]
+            if t[2] == "list"
+                # property list <count_type> <index_type> <name>
+                ct = _PLY_TYPE[String(t[3])]; it = _PLY_TYPE[String(t[4])]
+                push!(props, (:list, String(t[5]), ct, it))
+            else
+                push!(props, (:scalar, String(t[3]), _PLY_TYPE[String(t[2])]))
+            end
+        elseif tag == "end_header"
+            break
+        end
+    end
+
+    # --- Locate vertex/face elements and column roles. ---
+    positions = Float64[]; normals = Float64[]; colors = Float64[]
+    indices = Int[]
+    have_normals = false; have_color = false
+    color_is_int = false
+
+    for (ename, ecount, props) in elements
+        if ename == "vertex"
+            # Map property name -> column index for the roles we read.
+            names = String[p[2] for p in props]
+            types = Symbol[p[1] === :scalar ? p[3] : :u32 for p in props]
+            col(name) = findfirst(==(name), names)
+            ix = col("x"); iy = col("y"); iz = col("z")
+            (ix === nothing || iy === nothing || iz === nothing) && error("PLY vertex element lacks x/y/z")
+            inx = col("nx"); iny = col("ny"); inz = col("nz")
+            have_normals = inx !== nothing && iny !== nothing && inz !== nothing
+            ir = col("red"); ig = col("green"); ib = col("blue")
+            if ir === nothing
+                ir = col("r"); ig = col("g"); ib = col("b")
+            end
+            have_color = ir !== nothing && ig !== nothing && ib !== nothing
+            have_color && (color_is_int = _ply_is_int(types[ir]))
+            cnorm = color_is_int ? 255.0 : 1.0
+
+            positions = Vector{Float64}(undef, ecount * 3)
+            have_normals && (normals = Vector{Float64}(undef, ecount * 3))
+            have_color && (colors = Vector{Float64}(undef, ecount * 3))
+
+            if format == :ascii
+                for v in 0:ecount-1
+                    toks = split(strip(next_line()))
+                    row = [parse(Float64, tok) for tok in toks]
+                    b3 = v * 3
+                    positions[b3+1] = row[ix]; positions[b3+2] = row[iy]; positions[b3+3] = row[iz]
+                    if have_normals
+                        normals[b3+1] = row[inx]; normals[b3+2] = row[iny]; normals[b3+3] = row[inz]
+                    end
+                    if have_color
+                        colors[b3+1] = row[ir]/cnorm; colors[b3+2] = row[ig]/cnorm; colors[b3+3] = row[ib]/cnorm
+                    end
+                end
+            else
+                # Binary: read every property in declared order; keep the roles.
+                for v in 0:ecount-1
+                    b3 = v * 3
+                    for (c, p) in enumerate(props)
+                        val, i = _ply_read_le(bytes, i, types[c])
+                        if c == ix; positions[b3+1] = val
+                        elseif c == iy; positions[b3+2] = val
+                        elseif c == iz; positions[b3+3] = val
+                        elseif have_normals && c == inx; normals[b3+1] = val
+                        elseif have_normals && c == iny; normals[b3+2] = val
+                        elseif have_normals && c == inz; normals[b3+3] = val
+                        elseif have_color && c == ir; colors[b3+1] = val/cnorm
+                        elseif have_color && c == ig; colors[b3+2] = val/cnorm
+                        elseif have_color && c == ib; colors[b3+3] = val/cnorm
+                        end
+                    end
+                end
+            end
+        elseif ename == "face"
+            # Find the list property (vertex_indices / vertex_index).
+            listp = nothing
+            for p in props
+                p[1] === :list && (listp = p)
+            end
+            listp === nothing && error("PLY face element has no list property")
+            ct = listp[3]; it = listp[4]
+            if format == :ascii
+                for _ in 0:ecount-1
+                    toks = split(strip(next_line()))
+                    nidx = parse(Int, toks[1])
+                    fan = [parse(Int, toks[1+k]) for k in 1:nidx]   # 0-based vertex indices
+                    for k in 2:(nidx - 1)
+                        push!(indices, fan[1] + 1, fan[k] + 1, fan[k+1] + 1)
+                    end
+                end
+            else
+                for _ in 0:ecount-1
+                    cnt, i = _ply_read_le(bytes, i, ct)
+                    nidx = Int(round(cnt))
+                    fan = Vector{Int}(undef, nidx)
+                    for k in 1:nidx
+                        val, i = _ply_read_le(bytes, i, it)
+                        fan[k] = Int(round(val))        # 0-based
+                    end
+                    for k in 2:(nidx - 1)
+                        push!(indices, fan[1] + 1, fan[k] + 1, fan[k+1] + 1)
+                    end
+                end
+            end
+        else
+            # Unknown element: skip its rows so the byte cursor stays aligned.
+            if format == :ascii
+                for _ in 0:ecount-1; next_line(); end
+            else
+                # Skip only when every property is fixed-size scalar (lists need
+                # per-row length; unsupported skip would corrupt the stream).
+                for p in props
+                    p[1] === :list && error("cannot skip PLY element '$ename' with list property")
+                end
+                rowbytes = sum(_PLY_SIZE[p[3]] for p in props)
+                i += ecount * rowbytes
+            end
+        end
+    end
+
+    nverts = length(positions) ÷ 3
+    nfaces = length(indices) ÷ 3
+    geo = BufferGeometry(positions, have_normals ? normals : Float64[], Float64[],
+                         indices, nverts, nfaces)
+    have_normals || compute_vertex_normals!(geo)
+    have_color && set_attribute!(geo, :color, colors, 3)
     return geo
 end
