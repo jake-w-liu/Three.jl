@@ -212,14 +212,15 @@ end
 abstract type AbstractKeyframeTrack end
 
 # Scalar/Vec3 property track. `interpolation` selects the sampling mode:
-#   :linear (default)  — piecewise linear, byte-identical to the original path.
-#   :cubic             — Catmull-Rom spline through the keyframes.
+#   :linear (default) — piecewise linear, byte-identical to the original path.
+#   :step             — hold the previous keyframe value until the next key.
+#   :cubic            — Catmull-Rom spline through the keyframes.
 struct KeyframeTrack <: AbstractKeyframeTrack
     target::AbstractObject3D
     property::Symbol                 # e.g. :position, :scale
     times::Vector{Float64}
     values::Vector{Vec3{Float64}}
-    interpolation::Symbol            # :linear | :cubic
+    interpolation::Symbol            # :linear | :step | :cubic
 end
 
 # Backward-compatible four-argument constructor: the original positional call
@@ -228,7 +229,9 @@ end
 KeyframeTrack(target::AbstractObject3D, property::Symbol,
               times::Vector{Float64}, values::Vector{Vec3{Float64}};
               interpolation::Symbol=:linear) =
-    KeyframeTrack(target, property, times, values, interpolation)
+    interpolation in (:linear, :step, :cubic) ?
+        KeyframeTrack(target, property, times, values, interpolation) :
+        throw(ArgumentError("unsupported keyframe interpolation: $interpolation"))
 
 # Dedicated rotation track: quaternion keyframes interpolated with slerp between
 # adjacent frames (three.js `QuaternionKeyframeTrack`), rather than componentwise
@@ -298,9 +301,19 @@ function interpolate_catmull_rom(times::AbstractVector, values::AbstractVector, 
 end
 
 # Sample a single track value at absolute time `t` according to its mode.
-_track_value(tr::KeyframeTrack, t) =
-    tr.interpolation === :cubic ? interpolate_catmull_rom(tr.times, tr.values, t) :
-                                  interpolate_linear(tr.times, tr.values, t)
+function _track_value(tr::KeyframeTrack, t)
+    if tr.interpolation === :cubic
+        return interpolate_catmull_rom(tr.times, tr.values, t)
+    elseif tr.interpolation === :step
+        n = length(tr.times)
+        n == 0 && error("cannot sample an empty KeyframeTrack")
+        t <= tr.times[1] && return tr.values[1]
+        t >= tr.times[n] && return tr.values[n]
+        return tr.values[searchsortedlast(tr.times, t)]
+    else
+        return interpolate_linear(tr.times, tr.values, t)
+    end
+end
 
 """Slerp a quaternion track between adjacent keyframes (clamped at the ends)."""
 function _track_value(tr::QuaternionKeyframeTrack, t)

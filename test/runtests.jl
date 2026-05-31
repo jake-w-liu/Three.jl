@@ -415,6 +415,27 @@ using ForwardDiff
         rm(f)
     end
 
+    @testset "I/O — WebGL HTML export" begin
+        scene = Scene(background=Color3(0.01, 0.02, 0.03))
+        mesh = Mesh(BoxGeometry(), MeshStandardMaterial(color=Color3(0.2, 0.7, 1.0)); name="export_box")
+        add!(scene, mesh)
+        clip = AnimationClip("move", [KeyframeTrack(mesh, :position, [0.0, 1.0],
+                                                    [Vec3(0.0,0.0,0.0), Vec3(1.0,0.0,0.0)])])
+        f = tempname() * ".html"
+        save_webgl_html(f, [WebGLExportCase("case", "Case", "Generated from </script><script>alert(1)</script>", scene;
+                                            target=Vec3(0.0,0.0,0.0), animations=[clip])];
+                        title="A & <B>")
+        html = read(f, String)
+        @test occursin("<title>A &amp; &lt;B&gt;</title>", html)
+        @test occursin("\"name\":\"export_box\"", html)
+        @test occursin("\"animations\"", html)
+        @test occursin("Uint32Array", html)
+        @test occursin("</script><script>alert", html) == false
+        @test occursin("KeyframeTrack", html) == false
+        @test_throws ArgumentError save_webgl_html(tempname() * ".html", WebGLExportCase[])
+        rm(f)
+    end
+
     @testset "Ambient is uniform fill, not directional (regression)" begin
         mat = MeshLambertMaterial(color=Color3(0.6, 0.6, 0.6))
         amb = AbstractLight[AmbientLight(intensity=0.5)]
@@ -1356,6 +1377,14 @@ using ForwardDiff
         mixer_update!(mx, 1.0)                                   # now t=1.5
         @test mesh.position.x ≈ 10.0
         @test mesh.position.y ≈ 2.5
+        step = KeyframeTrack(mesh, :position, [0.0, 1.0, 2.0],
+                             [Vec3(0.0,0,0), Vec3(10.0,0,0), Vec3(20.0,0,0)];
+                             interpolation=:step)
+        @test sample_track(step, 0.5).x ≈ 0.0
+        @test sample_track(step, 1.0).x ≈ 10.0
+        @test sample_track(step, 1.5).x ≈ 10.0
+        @test_throws ArgumentError KeyframeTrack(mesh, :position, [0.0], [Vec3(0.0,0,0)];
+                                                 interpolation=:bogus)
     end
 
     @testset "Helpers" begin
@@ -2672,6 +2701,60 @@ using ForwardDiff
             rm(path; force=true)
         end
 
+        @testset "load_gltf_asset animations" begin
+            dir = mktempdir()
+            bin = UInt8[]
+            append_f32!(xs) = append!(bin, reinterpret(UInt8, Float32.(xs)))
+            off_times = length(bin); append_f32!([0, 1, 2])
+            off_trans = length(bin); append_f32!([0,0,0, 2,0,0, 4,0,0])
+            off_rot = length(bin); append_f32!([0,0,0,1, 0,sin(pi/4),0,cos(pi/4), 0,1,0,0])
+            off_scale = length(bin); append_f32!([1,1,1, 2,2,2, 4,4,4])
+            write(joinpath(dir, "anim.bin"), bin)
+            json = """
+            {"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],
+             "nodes":[{"name":"animated"}],
+             "buffers":[{"byteLength":$(length(bin)),"uri":"anim.bin"}],
+             "bufferViews":[
+               {"buffer":0,"byteOffset":$off_times,"byteLength":12},
+               {"buffer":0,"byteOffset":$off_trans,"byteLength":36},
+               {"buffer":0,"byteOffset":$off_rot,"byteLength":48},
+               {"buffer":0,"byteOffset":$off_scale,"byteLength":36}],
+             "accessors":[
+               {"bufferView":0,"componentType":5126,"count":3,"type":"SCALAR"},
+               {"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"},
+               {"bufferView":2,"componentType":5126,"count":3,"type":"VEC4"},
+               {"bufferView":3,"componentType":5126,"count":3,"type":"VEC3"}],
+             "animations":[{"name":"move_rotate","samplers":[
+               {"input":0,"output":1,"interpolation":"LINEAR"},
+               {"input":0,"output":2,"interpolation":"LINEAR"},
+               {"input":0,"output":3,"interpolation":"STEP"}],
+               "channels":[
+                 {"sampler":0,"target":{"node":0,"path":"translation"}},
+                 {"sampler":1,"target":{"node":0,"path":"rotation"}},
+                 {"sampler":2,"target":{"node":0,"path":"scale"}}]}]}
+            """
+            path = joinpath(dir, "anim.gltf")
+            write(path, json)
+            asset = load_gltf_asset(path)
+            @test asset isa GLTFAsset
+            @test asset.scene isa Scene
+            @test length(asset.animations) == 1
+            @test asset.animations[1].duration ≈ 2.0
+            target = get_children(asset.scene)[1]
+            mixer = AnimationMixer(asset.animations[1])
+            mixer_set_time!(mixer, 0.5)
+            @test target.position.x ≈ 1.0
+            @test target.position.y ≈ 0.0
+            @test target.rotation.y ≈ pi/4 atol=1e-9
+            @test target.scale.x ≈ 1.0
+            mixer_set_time!(mixer, 1.5)
+            @test target.position.x ≈ 3.0
+            @test target.scale.x ≈ 2.0
+            p = mat4_transform_point(compute_world_matrix(target), Vec3(1.0,0.0,0.0))
+            @test p.x ≈ target.position.x - sqrt(2.0) atol=1e-9
+            @test p.z ≈ -sqrt(2.0) atol=1e-9
+        end
+
         # [F:loaders] Stanford PLY loader (load_ply)
         @testset "load_ply ascii + binary" begin
             # Reference single coloured triangle with explicit normals.
@@ -2750,6 +2833,38 @@ using ForwardDiff
 
         # look_at / view matrix is finite when eye == target.
         @test all(isfinite, view_matrix_from_params(1.0,1.0,1.0, 1.0,1.0,1.0, 0.0,1.0,0.0).e)
+        @test let z = normalize(Vec3(0.0,0.0,0.0))
+            all(isfinite, (z.x,z.y,z.z)) && z.x == 0.0 && z.y == 0.0 && z.z == 0.0
+        end
+
+        # Raycaster accepts integer Vec3 inputs and keeps finite Float64 rays.
+        @test let rc = Raycaster(Vec3(0,0,5), Vec3(0,0,-1))
+            rc.ray isa Ray{Float64} && all(isfinite, (rc.ray.origin.z, rc.ray.direction.z))
+        end
+
+        # Perspective set_from_camera! rays originate at the camera position,
+        # while orthographic rays keep the screen-dependent near-plane origin.
+        @test let cam = PerspectiveCamera(fov=π/4, aspect=1.0, near=0.1, far=100.0),
+                  rc = Raycaster(Vec3(0.0,0.0,0.0), Vec3(0.0,0.0,-1.0))
+            cam.position = Vec3(0.0,0.0,5.0); cam.target = Vec3(0.0,0.0,0.0)
+            set_from_camera!(rc, cam, 0.0, 0.0)
+            isapprox(rc.ray.origin.z, 5.0; atol=1e-12)
+        end
+        @test let cam = OrthographicCamera(left=-1.0, right=1.0, bottom=-1.0, top=1.0, near=0.1, far=100.0),
+                  rc = Raycaster(Vec3(0.0,0.0,0.0), Vec3(0.0,0.0,-1.0))
+            set_from_camera!(rc, cam, 0.5, 0.0)
+            abs(rc.ray.origin.x - cam.position.x) > 0.1
+        end
+
+        # Reparenting keeps the scene graph a tree and duplicate adds are no-ops.
+        @test let a = Group(), b = Group(), child = Object3D()
+            add!(a, child); add!(a, child); add!(b, child)
+            isempty(get_children(a)) && length(get_children(b)) == 1 && get_parent(child) === b
+        end
+        @test_throws ArgumentError begin
+            o = Object3D()
+            add!(o, o)
+        end
 
         # normal matrix == transpose(inverse).
         Mn = mat4_scaling(2.0,1.0,1.0)

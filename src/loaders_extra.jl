@@ -474,6 +474,11 @@ end
 
 const _GLTF_COMP_SIZE = Dict("SCALAR"=>1, "VEC2"=>2, "VEC3"=>3, "VEC4"=>4, "MAT4"=>16)
 
+struct GLTFAsset
+    scene::Scene
+    animations::Vector{AnimationClip}
+end
+
 function _gltf_read_buffer(buf::Dict, dir::String)
     uri = get(buf, "uri", nothing)
     uri === nothing && error("glTF buffer without uri (GLB not supported)")
@@ -589,8 +594,9 @@ end
 # `load_gltf` (text/embedded buffers) and `load_glb` (binary container, where
 # the BIN chunk is supplied as buffer 0). `buffers` must already contain the raw
 # bytes for every buffer referenced by the document.
-function _gltf_build_scene(gltf, buffers)
+function _gltf_build_scene(gltf, buffers; return_nodes::Bool=false)
     scene = Scene()
+    node_objects = Dict{Int, AbstractObject3D}()
 
     function build_primitive(prim)
         attrs = prim["attributes"]
@@ -619,6 +625,7 @@ function _gltf_build_scene(gltf, buffers)
         grp.position = pos
         grp.rotation = rot
         grp.scale = scl
+        node_objects[node_idx] = grp
         add!(parent, grp)
         if haskey(node, "mesh")
             mesh_def = gltf["meshes"][Int(node["mesh"]) + 1]
@@ -635,7 +642,62 @@ function _gltf_build_scene(gltf, buffers)
     for n in scene_def["nodes"]
         add_node!(scene, Int(n))
     end
-    return scene
+    return return_nodes ? (scene, node_objects) : scene
+end
+
+function _gltf_track_values(data::Vector{Float64}, ncomp::Int, count::Int, path::String)
+    if path == "rotation"
+        ncomp == 4 || error("glTF rotation animation accessor must be VEC4")
+        return [quat_normalize(Quaternion(data[4i-3], data[4i-2], data[4i-1], data[4i])) for i in 1:count]
+    elseif path == "translation" || path == "scale"
+        ncomp == 3 || error("glTF $path animation accessor must be VEC3")
+        return [Vec3(data[3i-2], data[3i-1], data[3i]) for i in 1:count]
+    else
+        return nothing
+    end
+end
+
+function _gltf_animation_clips(gltf, buffers, node_objects)
+    haskey(gltf, "animations") || return AnimationClip[]
+    clips = AnimationClip[]
+    for (ai, anim) in enumerate(gltf["animations"])
+        samplers = anim["samplers"]
+        channels = get(anim, "channels", Any[])
+        tracks = AbstractKeyframeTrack[]
+        for ch in channels
+            target = ch["target"]
+            haskey(target, "node") || continue
+            node_idx = Int(target["node"])
+            haskey(node_objects, node_idx) || continue
+            path = String(target["path"])
+            path in ("translation", "rotation", "scale") || continue
+            sampler = samplers[Int(ch["sampler"]) + 1]
+            interpolation = Symbol(lowercase(String(get(sampler, "interpolation", "LINEAR"))))
+            interpolation === :cubicspline &&
+                error("glTF CUBICSPLINE animation interpolation is not supported yet")
+            times, tncomp, tcount = _gltf_accessor(gltf, buffers, Int(sampler["input"]))
+            tncomp == 1 || error("glTF animation input accessor must be SCALAR")
+            out, ncomp, count = _gltf_accessor(gltf, buffers, Int(sampler["output"]))
+            vals = _gltf_track_values(out, ncomp, count, path)
+            vals === nothing && continue
+            length(times) == length(vals) || error("glTF animation input/output keyframe counts differ")
+            obj = node_objects[node_idx]
+            if path == "rotation"
+                push!(tracks, QuaternionKeyframeTrack(obj, :rotation, times, vals))
+            else
+                prop = path == "translation" ? :position : :scale
+                push!(tracks, KeyframeTrack(obj, prop, times, vals; interpolation=interpolation))
+            end
+        end
+        name = String(get(anim, "name", "animation_$ai"))
+        push!(clips, AnimationClip(name, tracks))
+    end
+    return clips
+end
+
+function _gltf_build_asset(gltf, buffers)
+    scene, node_objects = _gltf_build_scene(gltf, buffers; return_nodes=true)
+    return GLTFAsset(scene, _gltf_animation_clips(gltf, buffers, node_objects))
 end
 
 """
@@ -650,6 +712,21 @@ function load_gltf(path::String)
     dir = dirname(path)
     buffers = [_gltf_read_buffer(b, dir) for b in gltf["buffers"]]
     return _gltf_build_scene(gltf, buffers)
+end
+
+"""
+    load_gltf_asset(path) -> GLTFAsset
+
+Load a glTF 2.0 file and return both the scene and parsed animation clips.
+Node `translation`, `rotation`, and `scale` channels are mapped to Three.jl
+`KeyframeTrack` / `QuaternionKeyframeTrack` objects targeting the loaded scene
+nodes, so an `AnimationMixer(asset.animations[1])` can play them back.
+"""
+function load_gltf_asset(path::String)
+    gltf = _json_parse(read(path, String))
+    dir = dirname(path)
+    buffers = [_gltf_read_buffer(b, dir) for b in gltf["buffers"]]
+    return _gltf_build_asset(gltf, buffers)
 end
 
 # Resolve a glTF buffer that may reference the GLB binary chunk. A buffer with no
@@ -714,4 +791,40 @@ function load_glb(path::String)
     dir = dirname(path)
     buffers = [_glb_read_buffer(b, dir, bin_bytes) for b in gltf["buffers"]]
     return _gltf_build_scene(gltf, buffers)
+end
+
+"""Load a binary glTF (`.glb`) and return both scene and animation clips."""
+function load_glb_asset(path::String)
+    bytes = read(path)
+    length(bytes) >= 12 || error("GLB file too short")
+    magic = _rd_le32(bytes, 1)
+    magic == 0x46546C67 || error("not a GLB file (bad magic)")
+    version = _rd_le32(bytes, 5)
+    version == 2 || error("unsupported GLB version $version")
+    total = min(_rd_le32(bytes, 9), length(bytes))
+
+    json_bytes = UInt8[]
+    bin_bytes = UInt8[]
+    have_json = false
+    pos = 13
+    while pos + 8 <= total + 1
+        clen = _rd_le32(bytes, pos)
+        ctype = _rd_le32(bytes, pos + 4)
+        dstart = pos + 8
+        dend = dstart + clen - 1
+        dend <= length(bytes) || error("GLB chunk exceeds file bounds")
+        if ctype == 0x4E4F534A
+            json_bytes = bytes[dstart:dend]
+            have_json = true
+        elseif ctype == 0x004E4942
+            bin_bytes = bytes[dstart:dend]
+        end
+        pos = dend + 1 + (4 - (clen % 4)) % 4
+    end
+    have_json || error("GLB has no JSON chunk")
+
+    gltf = _json_parse(String(json_bytes))
+    dir = dirname(path)
+    buffers = [_glb_read_buffer(b, dir, bin_bytes) for b in gltf["buffers"]]
+    return _gltf_build_asset(gltf, buffers)
 end

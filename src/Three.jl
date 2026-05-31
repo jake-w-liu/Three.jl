@@ -81,6 +81,7 @@ include("differentiable.jl")
 
 # ========================== I/O ==========================
 include("io.jl")
+include("web_export.jl")
 
 # ========================== Loaders ==========================
 include("loaders.jl")
@@ -206,11 +207,13 @@ export
     # I/O
     save_ppm, save_ppm_binary, render_target_to_image, test_pattern,
     save_png, save_png_rgba, save_png16, save_pdf, image_to_uint8,
+    WebGLExportCase, save_webgl_html,
 
     # Loaders
     compute_vertex_normals!, save_stl_binary, load_stl, load_obj,
     inflate, zlib_inflate, load_png, TextureLoader,
     load_mtl, load_obj_groups, base64_decode, load_gltf,
+    GLTFAsset, load_gltf_asset,
 
     # Audit round-2 feature additions (2026-05-29)
     orbit_update!, AbstractKeyframeTrack, QuaternionKeyframeTrack, sample_track,
@@ -225,6 +228,6 @@ export
     IESProfile, parse_ies, ies_candela, ies_intensity,
     sample_texture_aniso,
     bloom_pass, fxaa_pass, outline_pass, ssao_pass, bokeh_pass,
-    load_glb, load_ply
+    load_glb, load_glb_asset, load_ply
 
 end # module Three

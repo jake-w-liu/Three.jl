@@ -29,6 +29,10 @@ function Object3D(; name="")
 end
 
 function add!(parent::AbstractObject3D, child::AbstractObject3D)
+    parent === child && throw(ArgumentError("Object3D cannot be added as a child of itself"))
+    old_parent = get_parent(child)
+    old_parent === parent && return parent
+    old_parent !== nothing && remove!(old_parent, child)
     push!(get_children(parent), child)
     set_parent!(child, parent)
     return parent

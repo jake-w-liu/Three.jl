@@ -44,7 +44,11 @@ cross(a::Vec3, b::Vec3) = Vec3(
     a.x * b.y - a.y * b.x
 )
 norm(a::Vec3) = sqrt(dot(a, a))
-normalize(a::Vec3) = a / norm(a)
+function normalize(a::Vec3)
+    l = norm(a)
+    l > 1e-20 || return Vec3(zero(a.x), zero(a.y), zero(a.z))
+    return a / l
+end
 lerp(a::Vec3, b::Vec3, t::Real) = a * (1 - t) + b * t
 distance(a::Vec3, b::Vec3) = norm(a - b)
 
@@ -409,6 +413,13 @@ struct Ray{T<:Real}
     origin::Vec3{T}
     direction::Vec3{T}
 end
+Ray(origin::Vec3, direction::Vec3) =
+    Ray(Vec3(promote(origin.x, direction.x)[1],
+             promote(origin.y, direction.y)[1],
+             promote(origin.z, direction.z)[1]),
+        Vec3(promote(origin.x, direction.x)[2],
+             promote(origin.y, direction.y)[2],
+             promote(origin.z, direction.z)[2]))
 
 struct Plane{T<:Real}
     normal::Vec3{T}

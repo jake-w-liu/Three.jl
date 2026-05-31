@@ -42,7 +42,9 @@ end
 Raycaster(origin::Vec3, dir::Vec3; near=0.0, far=Inf,
           layers::Layers=layers_enable_all!(Layers()),
           point_threshold=1.0, line_threshold=1.0) =
-    Raycaster(Ray(origin, normalize(dir)), near, far, layers,
+    Raycaster(Ray(Vec3(Float64(origin.x), Float64(origin.y), Float64(origin.z)),
+                  normalize(Vec3(Float64(dir.x), Float64(dir.y), Float64(dir.z)))),
+              Float64(near), Float64(far), layers,
               Float64(point_threshold), Float64(line_threshold))
 
 """
@@ -98,9 +100,10 @@ function _camera_ray(camera::AbstractCamera, ndc_x, ndc_y)
     inv_vp = mat4_inverse(projection_matrix(camera) * view_matrix(camera))
     p_near = mat4_transform_point(inv_vp, Vec3(ndc_x, ndc_y, -1.0))
     p_far  = mat4_transform_point(inv_vp, Vec3(ndc_x, ndc_y, 1.0))
-    # Origin is the unprojected near-plane point; correct for both perspective and
-    # orthographic cameras (parallel ortho rays do not share an apex).
-    Ray(p_near, normalize(p_far - p_near))
+    # Perspective rays originate at the camera apex; orthographic rays originate
+    # at the unprojected near-plane point because they do not share an apex.
+    origin = camera isa PerspectiveCamera ? camera.position : p_near
+    Ray(origin, normalize(p_far - p_near))
 end
 
 """Aim the raycaster through screen NDC `(x,y)` from a camera (three.js `setFromCamera`)."""
